@@ -30,10 +30,6 @@ software/digital_twin/simulator/pinn_inversion/__init__.py
 software/digital_twin/simulator/pinn_inversion/inversion_pinn_model.py
 software/digital_twin/simulator/pinn_inversion/pinn_inversion_server.py
 software/digital_twin/visualization/__init__.py
-software/digital_twin/visualization/viz_gateway/__init__.py
-software/digital_twin/visualization/viz_gateway/streamlit_viz_app.py
-software/digital_twin/visualization/viz_gateway/visualization_service.py
-software/digital_twin/visualization/viz_gateway/viz_gateway_server.py
 software/startup/__init__.py
 software/startup/service_runners.py
 software/startup/start_all_services.py
@@ -43,7 +39,6 @@ software/startup/start_observation_ingestion.py
 software/startup/start_pinn_forward.py
 software/startup/start_pinn_inversion.py
 software/startup/start_viz_dashboard.py
-software/startup/start_viz_gateway.py
 software/startup/docker_services/__init__.py
 software/startup/docker_services/common_docker_utils.py
 software/startup/docker_services/start_influxdb.py
