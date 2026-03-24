@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "PINNInversionOutputMessage",
-  "description": "Output message for the PINN inversion service",
+  "title": "FEMInversionOutputMessage",
+  "description": "Output message for the FEM inversion service",
   "type": "object",
   "properties": {
     "timestamp": { "type": "string", "format": "date-time" },
