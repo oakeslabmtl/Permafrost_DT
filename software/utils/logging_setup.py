@@ -40,7 +40,7 @@ def _should_enable_json(enable_json: Optional[bool]) -> bool:
 
 
 def _build_config(enable_json: bool) -> Dict[str, Any]:
-    datefmt = "%Y-%m-%d %H:%M:%S.%f"
+    datefmt = "%Y-%m-%d %H:%M:%S"
     common_format = "%(asctime)s %(levelname)s %(name)s : %(message)s"
 
     formatters: Dict[str, Any] = {

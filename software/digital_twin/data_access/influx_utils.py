@@ -294,16 +294,16 @@ class InfluxHelper:
         validation: dict[str, float] | None = None,
         timestamp: datetime.datetime | None = None,
     ) -> None:
-        """Persist aggregated PINN inversion parameters for downstream visualization."""
+        """Persist aggregated FEM inversion parameters for downstream visualization."""
 
         if not parameters:
             return
 
         if self.write_api is None:  # pragma: no cover - runtime fallback
-            self.logger.warning("Influx write skipped (no client available) for measurement pinn_inversion")
+            self.logger.warning("Influx write skipped (no client available) for measurement fem_inversion")
             return
 
-        record = Point("pinn_inversion").tag("site_id", site).tag("status", status)
+        record = Point("fem_inversion").tag("site_id", site).tag("status", status)
         timestamp = timestamp or datetime.datetime.utcnow()
 
         for key, value in parameters.items():
@@ -711,7 +711,7 @@ class InfluxHelper:
         """Fetch recorded inversion parameter sets."""
 
         return self._query_measurement(
-            "pinn_inversion",
+            "fem_inversion",
             site=site,
             limit=limit,
             range_start=range_start,

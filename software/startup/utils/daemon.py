@@ -23,12 +23,12 @@ def start_as_daemon(
     if kwargs is None:
         kwargs = {}
 
-    # Use the 'fork' start method so nested/local callables (closures) do not
-    # need to be pickled. On some Python builds the default context may be
-    # 'forkserver' or 'spawn', which requires targets to be importable
-    # top-level callables. For this launcher we run on Linux where 'fork' is
-    # available and acceptable.
-    ctx = get_context("fork")
+    # Use 'fork' on Unix (where it's available) for better support of closures.
+    # Fall back to 'spawn' on Windows/other systems that don't support 'fork'.
+    try:
+        ctx = get_context("fork")
+    except ValueError:
+        ctx = get_context("spawn")
 
     ok_queue: Queue[Any] = Queue(ctx=ctx)
     kwargs.setdefault("ok_queue", ok_queue)
