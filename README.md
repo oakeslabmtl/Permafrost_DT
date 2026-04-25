@@ -1,6 +1,6 @@
 # Permafrost Digital Twin (permafrost_DT)
 
-This repository implements a digital twin system for permafrost thermal modeling and monitoring. The system combines classical finite difference methods (FDM) with physics-informed neural networks (PINNs) to simulate, infer, and visualize subsurface temperature fields.
+This repository implements a digital twin system for permafrost thermal monitoring and control. The system uses finite element methods (FEM) for both forward simulation and material parameter inversion, coupled with real-time sensor ingestion, thaw-front reconstruction, safety monitoring, and heater actuation.
 
 # Contents
 - [About this Project](#about-this-project)
@@ -11,111 +11,138 @@ This repository implements a digital twin system for permafrost thermal modeling
   - [Configuration](#configuration)
   - [Quick service bootstrap](#quick-service-bootstrap)
 - [Running individual services](#running-individual-services)
+- [Tools](#tools)
 - [Tests](#tests)
 - [Troubleshooting](#troubleshooting)
 
 # About this Project
 
-**Goal:** The goal of this digital twin is to provide accurate thermal modeling and monitoring of permafrost, enabling better understanding and prediction of subsurface temperature dynamics.
+**Goal:** Provide accurate real-time thermal modeling and closed-loop control for permafrost, enabling continuous monitoring, parameter estimation, thaw-front tracking, and automated heater control.
 
 **Key Features:**
-- Real-time temperature field simulation using FDM
-- Physics-informed neural networks for forward modeling and parameter inversion
-- Boundary condition estimation from sensor data
-- Visualization of temperature fields and model outputs
-- Time-series data storage and analysis
-- Message-based service architecture
-
-The system uses InfluxDB for time-series storage and RabbitMQ for inter-service messaging.
+- Real-time 2D temperature field simulation using FEM
+- FEM-based material parameter inversion from sensor data
+- Boundary condition estimation from 2D sensor arrays
+- Thaw-front reconstruction and safety limit enforcement
+- Automated heater actuation based on safety alerts
+- Streamlit visualization dashboard backed by InfluxDB
+- Message-based microservice architecture via RabbitMQ
 
 # System Architecture
 
-The digital twin follows a microservices architecture pattern, with distinct services communicating via RabbitMQ messaging:
+Services communicate asynchronously via RabbitMQ queues. InfluxDB stores all time-series data.
 
-## Core Services
+## Data Flow
 
-1. **Observation Ingestion Server** (`digital_twin/monitoring/observation_ingestion`)
-   - Ingests temperature sensor data
-   - Writes observations to InfluxDB
-   - Publishes data for other services
+```
+2D Sensors
+    │
+    ▼
+Observation Ingestion ──► InfluxDB
+    │ (fanout: permafrost.sensors.2d)
+    ├──► Boundary Condition Builder ──► boundary.2d ──► FEM Forecast ──► fem_forecast.2d ──► Safety Monitor
+    │                                                └──► FEM Inversion ──► fem_inversion ──► InfluxDB          │
+    ├──► Thaw Front Reconstruction ──► thaw_front.2d ──────────────────────────────────────► Safety Monitor     │
+    │                                                                                              │             │
+    │                                                                                              ▼             │
+    │                                                                                       safety_alerts.2d     │
+    │                                                                                              │             │
+    │                                                                                              ▼             │
+    │                                                                                      Heater Actuation       │
+    │                                                                                    (command + action queues)│
+    └──────────────────────────────────────────────────────────────────────────────────────────────────────────►  Viz Dashboard (reads InfluxDB directly)
+```
 
-2. **Boundary Forcing Server** (`digital_twin/monitoring/boundary_forcing`)
-   - Processes sensor data to derive boundary conditions
-   - Supports synthetic boundary generation
-   - Provides inputs for simulation models
+## Services
 
-3. **FDM Simulator** (`digital_twin/simulator/fdm`)
-   - Classical finite difference method solver
-   - Simulates subsurface temperature evolution
-   - Writes results to InfluxDB
+### Monitoring
+1. **Observation Ingestion** (`monitoring/observation_ingestion`)
+   - Consumes 2D sensor snapshots from the `permafrost.sensors.2d` fanout exchange
+   - Writes temperature observations to InfluxDB
+   - Entry point: `start_observation_ingestion_2d.py`
 
-4. **PINN Forward Model** (`digital_twin/simulator/pinn_forward`)
-   - Physics-informed neural network implementation
-   - Predicts temperature fields from boundary conditions
-   - Optional training mode for model refinement
+2. **Boundary Condition Builder** (`monitoring/boundary_condition_builder`)
+   - Derives FEM boundary conditions (Robin/Neumann) from sensor data
+   - Publishes structured boundary messages to `permafrost.record.boundary.2d`
+   - Entry point: `start_boundary_condition_builder.py`
 
-5. **PINN Inversion Model** (`digital_twin/simulator/pinn_inversion`)
-   - Infers soil parameters from temperature data
-   - Uses FDM results for parameter estimation
-   - Optional training mode for optimization
+3. **Thaw Front Reconstruction** (`monitoring/thaw_front_reconstruction`)
+   - Interpolates 2D sensor fields and extracts the 0 °C isotherm
+   - Publishes thaw-front metrics and contour points
+   - Entry point: `start_thaw_front_reconstruction.py`
 
-6. **Visualization Gateway** (`digital_twin/visualization/viz_gateway`)
-   - Aggregates results from all models
-   - Generates visualization-ready messages
-   - Supports real-time data streaming
+### Simulators
+4. **FEM Forecast** (`simulator/fem_forecast`)
+   - 2D finite element solver over a triangle mesh
+   - Runs a thermal forecast horizon from boundary conditions
+   - Publishes thaw-front radius and node-level field snapshots
+   - Mesh files live in `software/models/fem_mesh/`
+   - Entry point: `start_fem_forecast.py`
 
-7. **Visualization Dashboard** (`digital_twin/visualization/viz_gateway/streamlit_viz_app.py`)
-   - Streamlit-based web UI consuming the same InfluxDB streams
-   - Provides contour plots, comparisons, and diagnostics
-   - Offers auto-refresh and manual reload controls
+5. **FEM Inversion** (`simulator/fem_inversion`)
+   - Estimates material parameters (porosity, thermal conductivity, heat capacity) from sensor data
+   - Optimises against FEM simulations using `scipy.optimize`
+   - Publishes inverted parameters and validation metrics
+   - Entry point: `start_fem_inversion.py`
 
-## Infrastructure Components
+### Control
+6. **Safety Monitor** (`control/safety_monitor`)
+   - Compares thaw-front radius against a configurable safety limit
+   - Fuses thaw-front reconstruction and FEM forecast inputs
+   - Emits safety alerts to `permafrost.record.safety_alerts.2d`
+   - Entry point: `start_safety_monitor.py`
 
-- **Communication Layer** (`digital_twin/communication/`)
-   - RabbitMQ messaging utilities
-   - Message schemas and validation
-   - Logging configuration
+7. **Heater Actuation** (`control/heater_actuation`)
+   - Translates safety alerts into heater commands (stop / hold)
+   - Publishes both the command and a logged action record
+   - Entry point: `start_heater_actuation.py`
 
-- **Data Access Layer** (`digital_twin/data_access/`)
-   - InfluxDB connection helpers
-   - Time-series data management
-   - Docker deployment assets
+### Visualization
+8. **Viz Dashboard** (`visualization/viz_dashboard`)
+   - Streamlit app that queries InfluxDB directly
+   - Displays temperature fields, thaw-front evolution, inversion results, and safety status
+   - Entry point: `start_viz_dashboard.py`
+
+## Infrastructure
+
+- **Communication** (`digital_twin/communication/`) — RabbitMQ client, JSON schema validation, logging
+- **Data Access** (`digital_twin/data_access/`) — InfluxDB helpers, Docker compose assets
+- **Startup** (`software/startup/`) — service launchers, daemon runner, config loader
+- **Tools** (`software/tools/`) — standalone utilities (see [Tools](#tools))
 
 ## Repository Structure
 
 ```
 permafrost_DT/
-├── requirements.txt        # Python dependencies
-├── README.md              # This documentation
-├── startup.conf           # Service configuration
-├── pytest.ini            # Test configuration
-├── data/                 # Data storage
-├── docs/                 # Architecture diagrams
-├── integration_tests/    # System-level tests
-├── logs/                 # Service logs
-├── resources/            # Additional resources
-└── software/            # Main codebase
-    └── digital_twin/    # Core services
-        ├── communication/  # Messaging
-        ├── data_access/   # Database
-        ├── monitoring/    # Data ingestion
-        ├── simulator/     # Models
-        └── visualization/ # Viz gateway
+├── startup.conf                  # Service configuration
+├── requirements.txt              # Python dependencies
+├── pytest.ini                   # Test configuration
+├── artifacts/                   # Runtime outputs (FEM fields, case results)
+├── data/                        # Data storage and exports
+├── docs/                        # Architecture diagrams
+├── logs/                        # Service logs (optional)
+└── software/
+    ├── digital_twin/
+    │   ├── communication/        # RabbitMQ client + JSON schemas
+    │   ├── control/              # Safety monitor, heater actuation
+    │   ├── data_access/          # InfluxDB helpers + Docker assets
+    │   ├── monitoring/           # Observation ingestion, BC builder, thaw front
+    │   ├── simulator/            # FEM forecast, FEM inversion
+    │   └── visualization/        # Streamlit dashboard
+    ├── models/
+    │   └── fem_mesh/             # Triangle mesh files (nodes, elements, edge sets)
+    ├── startup/                  # Service launchers and daemon utilities
+    ├── tests/                    # Unit and integration tests
+    ├── tools/                    # CLI utilities
+    └── utils/                    # Shared logging setup
 ```
 
 # Prerequisites
 
-Required software:
 - Python 3.10+
 - pip
 - Docker & Docker Compose
 - Git
-
-Optional but recommended:
-- CUDA-capable GPU for PINN acceleration
-- Python virtual environment (venv)
-
-**Note on PyTorch:** The installation method depends on your OS and whether you want CUDA support. Visit https://pytorch.org/get-started/locally/ to select the appropriate installation command. The `requirements.txt` includes a CPU-only `torch` entry by default.
 
 # Getting Started
 
@@ -135,155 +162,122 @@ Optional but recommended:
    .\venv\Scripts\activate   # Windows
    ```
 
-3. **Upgrade pip tooling (prevents the classic `setuptools`/`wheel` errors)**
+3. **Upgrade pip tooling**
    ```bash
    python -m pip install --upgrade pip setuptools wheel
    ```
 
-4. **Install the project requirements**
+4. **Install dependencies**
    ```bash
    pip install -r requirements.txt
    ```
 
-5. **(Recommended) Install the repository in editable mode so module imports just work**
+5. **Install the package in editable mode**
    ```bash
    pip install -e .
    ```
 
-6. **(Optional) Install GPU-enabled PyTorch**
-   ```bash
-   # Visit pytorch.org and follow instructions for your system
-   ```
-
 ## Configuration
 
-### Environment Variables
+All service parameters live in `startup.conf`. The defaults target a fully local developer setup. Review and adjust before starting:
 
-The services use these environment variables (with defaults):
-
-```bash
-# InfluxDB Configuration
-INFLUX_URL=http://localhost:8086
-INFLUX_TOKEN=<your-token>
-INFLUX_ORG=permafrost
-INFLUX_BUCKET=permafrost
-
-# RabbitMQ Configuration
-RABBITMQ_HOST=localhost
-RABBITMQ_USER=permafrost
-RABBITMQ_PASSWORD=permafrost
-```
-
-Set these in your shell or create a `.env` file (the startup helpers automatically load it if present).
-
-Before launching anything, review `startup.conf`—it contains the same values plus service-specific knobs (synthetic data, model paths, dashboard host/port, etc.). The default configuration targets a fully local developer machine, so updating the tokens/URLs there is usually the only manual step.
+- `rabbitmq` / `influxdb` — connection settings
+- `fem_forecast` — mesh paths, material properties, solver settings
+- `fem_inversion` — inversion parameters, bounds, convergence settings
+- `boundary_condition_builder` — boundary types (Robin/Neumann) and sensor overrides
+- `safety_monitor` — thaw-front radius limit and metric (`max` or `avg`)
+- `heater_actuation` — actions on alert/OK and setpoints
+- `viz_dashboard` — host, port, refresh interval, history depth
 
 ### Infrastructure Setup
 
-1. Start InfluxDB:
-```bash
-cd software/digital_twin/data_access/influxdbserver
-docker-compose up -d
-```
+Start InfluxDB and RabbitMQ via Docker:
 
-2. Start RabbitMQ:
 ```bash
-cd software/digital_twin/communication/installation/rabbitmq
-docker-compose up -d
-```
-
-Helper scripts are available in `software/startup/docker_services/`:
-```bash
+# Using helper scripts
 python software/startup/docker_services/start_influxdb.py
 python software/startup/docker_services/start_rabbitmq.py
+
+# Or directly with docker compose
+cd software/digital_twin/data_access/influxdbserver && docker compose up -d
+cd software/digital_twin/communication/installation/rabbitmq && docker compose up -d
 ```
 
 ### Quick service bootstrap
 
-Once the Docker dependencies are up, you can launch multiple services at once via:
+Once Docker services are up:
 
 ```bash
 python -m software.startup.start_all_services
 ```
 
-Uncomment the services you need inside `software/startup/start_all_services.py` (PINNs are off by default to keep startup light). Each runner inherits the configuration from `startup.conf`, so double-check model paths and synthetic-data switches before starting.
-
+This launches all services as daemon processes. Comment out any services you don't need inside `start_all_services.py` before running.
 
 ## Running individual services
 
-Many services are written as simple Python modules you can run directly. Example: run the viz gateway (ensure env vars are set):
+Each service can be launched independently:
 
 ```bash
-python software/digital_twin/visualization/viz_gateway/viz_gateway_server.py
+python -m software.startup.start_observation_ingestion_2d
+python -m software.startup.start_boundary_condition_builder
+python -m software.startup.start_thaw_front_reconstruction
+python -m software.startup.start_fem_forecast
+python -m software.startup.start_fem_inversion
+python -m software.startup.start_safety_monitor
+python -m software.startup.start_heater_actuation
+python -m software.startup.start_viz_dashboard
 ```
 
-Launch the interactive dashboard (optional, non-blocking) to visualise aggregated outputs:
+The dashboard can also be launched directly via Streamlit:
 
 ```bash
-streamlit run software/digital_twin/visualization/viz_gateway/streamlit_viz_app.py
+streamlit run software/digital_twin/visualization/viz_dashboard/viz_dashboard_app.py
 ```
 
-The command honours the `viz_dashboard` block in `startup.conf` (host, port, refresh, history depth). You can still run `python -m software.startup.start_viz_dashboard` if you prefer the managed launcher—it simply spawns the Streamlit app with the configured settings. The UI auto-refreshes every 60 seconds, and swaps in friendly placeholders until upstream datasets or diagnostics are available.
+# Tools
 
-If you run scripts directly from the `software` tree, the tests and some scripts include a small `sys.path` adjustment to allow running modules directly for development.
+Standalone utilities in `software/tools/`:
 
-### Synthetic observation stream
+- **`replay_csv.py`** — Replay a CSV of sensor readings into the RabbitMQ sensor queue (useful for testing without live hardware)
+  ```bash
+  python -m software.tools.replay_csv --file data/exports/my_sensors.csv
+  ```
 
-When you do not have physical sensors connected, the startup scripts can recycle the FDM simulator output as a sensor feed. By default `synthetic_observations.enabled` is `true` in `startup.conf`, which makes the FDM server publish depth samples (0–5 m) to the `permafrost.record.sensors.state` queue so the observation ingestion service keeps progressing. Adjust `synthetic_observations.depths_m` (integers 0–5) to change which depths are emitted, or disable the block entirely once real hardware is available.
+- **`run_fem_case.py`** — Run a standalone FEM simulation case and write results to `artifacts/fem_cases/`
+  ```bash
+  python -m software.tools.run_fem_case
+  ```
 
-### Synthetic boundary forcing
+- **`export_fem_results.py`** — Export FEM field results from InfluxDB to CSV
+  ```bash
+  python -m software.tools.export_fem_results
+  ```
 
-The boundary forcing server now falls back to a sinusoidal surface temperature when InfluxDB has no recent observations. Control this via the `synthetic_boundary` section in `startup.conf` (enabled by default). Tweak `start_day` and `step_days` to match the cadence you need, or set `enabled` to `false` once real surface measurements are being ingested.
+# Tests
 
-### PINN forward model
-
-The PINN forward service can operate purely in inference mode. Place your trained checkpoint at `software/models/pinn_forward/freezing_soil_pinn.pt` (or update `pinn_forward.model_path` in `startup.conf`) and leave `pinn_forward.enable_training` set to `false` to skip the costly retraining loop. Flip the flag back to `true` only when you intentionally want the service to optimise the network at runtime.
-
-### PINN inversion model
-
-Similarly, the inversion service can emit precomputed soil parameters without running the heavy optimisation loop. Drop your trained weights at `software/models/pinn_inversion/inversion_pinn.pt` (or point `pinn_inversion.model_path` elsewhere) and keep `pinn_inversion.enable_training` set to `false`. Re-enable it only when you plan to re-fit the inversion PINN from incoming data. The inversion step now consumes the finite-difference simulation results directly, so you can run it alongside—or instead of—the forward PINN without chaining the two together.
-
-## Tests
-
-Integration-style smoke tests live in the top-level `integration_tests/` directory.
-
-Run tests (simple invocation):
+Tests live in `software/tests/`. Run with:
 
 ```bash
 pytest -q
 ```
 
-Or you can run individual test scripts directly:
-
-```bash
-python integration_tests/test_viz_gateway_server.py
-python integration_tests/test_observation_ingestion_server.py
-```
-
 # Troubleshooting
 
-## Common Issues
+### RabbitMQ Connection Failed
+- Check container: `docker ps | grep rabbitmq`
+- Management UI: http://localhost:15672 (credentials: `permafrost` / `permafrost`)
+- Verify `host` in `startup.conf` matches your setup
 
-### Connection Problems
-- **RabbitMQ Connection Failed**
-  - Verify `RABBITMQ_HOST` is correct
-  - Check container status: `docker ps | grep rabbitmq`
-  - Check management UI: http://localhost:15672 
-  - Default credentials: `permafrost`/`permafrost`
+### InfluxDB Not Reachable
+- Check health: http://localhost:8086/health
+- Check container: `docker ps | grep influxdb`
+- Verify `url` and `token` in `startup.conf`
 
-- **InfluxDB Not Reachable**
-  - Verify `INFLUX_URL` is correct
-  - Check health endpoint: http://localhost:8086/health
-  - Verify container is running: `docker ps | grep influxdb`
-  - Check token validity in management UI
+### Import Errors
+- Ensure the package is installed: `pip install -e .`
+- Run scripts from the repository root using module notation: `python -m software.startup.<service>`
+- Verify the virtual environment is activated
 
-### Service Issues
-- **PINN Model Loading Errors**
-  - Verify model files exist in correct locations
-  - Check PyTorch CUDA compatibility
-  - Confirm Python environment has correct dependencies
-
-- **Import Errors**
-  - Run scripts from repository root
-  - Use module notation: `python -m software.digital_twin.{service}`
-  - Verify virtual environment is activated
+### FEM Mesh Not Found
+- Confirm mesh files exist in `software/models/fem_mesh/`
+- Check `fem_forecast.mesh_dir`, `node_file`, `element_file`, and `edge_sets` paths in `startup.conf`
