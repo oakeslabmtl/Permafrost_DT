@@ -67,6 +67,7 @@ class FEMForecastServer:
         solver: dict | None = None,
         save_field_csv_default: bool = True,
         include_field_default: bool = False,
+        sticky_material_override: bool = True,
         field_csv_dir: str | None = None,
     ) -> None:
         self.logger = get_logger("FEMForecastServer")
@@ -92,12 +93,14 @@ class FEMForecastServer:
         self.solver_config = solver or {}
         self.save_field_csv_default = self._as_bool(save_field_csv_default, True)
         self.include_field_default = self._as_bool(include_field_default, False)
+        self.sticky_material_override = self._as_bool(sticky_material_override, True)
         self.field_csv_dir = field_csv_dir
 
         self.mq_in: Optional[RabbitMQClient] = None
         self.mq_out: Optional[RabbitMQClient] = None
         self.influx: Optional[InfluxHelper] = None
         self._solver: Optional[FEMSolver2D] = None
+        self._last_material_override: dict[str, float] | None = None
 
     @staticmethod
     def _as_bool(value: object, default: bool) -> bool:
@@ -415,7 +418,21 @@ class FEMForecastServer:
             include_field = self._as_bool(msg.get("include_field"), self.include_field_default)
             save_field_csv = self._as_bool(msg.get("save_field_csv"), self.save_field_csv_default)
             field_csv_dir = msg.get("field_csv_dir", self.field_csv_dir)
-            material_override = msg.get("material_override")
+            raw_material_override = msg.get("material_override")
+            material_override: dict[str, float] | None = None
+            override_source = "default"
+            if raw_material_override is not None:
+                normalized_override = self._normalize_material_override(raw_material_override)
+                if normalized_override:
+                    material_override = normalized_override
+                    self._last_material_override = dict(normalized_override)
+                    override_source = "message"
+                else:
+                    self._last_material_override = None
+                    override_source = "cleared"
+            elif self.sticky_material_override and self._last_material_override is not None:
+                material_override = dict(self._last_material_override)
+                override_source = "sticky"
             
             # Choose forecast path based on flags
             if include_field or save_field_csv or material_override is not None:
@@ -431,10 +448,13 @@ class FEMForecastServer:
             else:
                 result = self._run_forecast(msg)
             
+            override_keys = sorted(material_override.keys()) if material_override else []
             self.logger.info(
-                "Received boundary snapshot (t=%.2fh, boundaries=%d)",
+                "Received boundary snapshot (t=%.2fh, boundaries=%d, override_source=%s, override_keys=%s)",
                 time_hours,
                 boundary_count,
+                override_source,
+                override_keys,
             )
             start_time = datetime.utcnow()
             if result.radius_max_m is None or result.radius_avg_m is None:

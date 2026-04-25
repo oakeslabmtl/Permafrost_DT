@@ -116,6 +116,7 @@ class FEMSolver2D:
     # GEOMETRY CACHING
     # Precomputes basis functions and Jacobians for performance
     # ---------------------------
+
     def _build_geometry_cache(self) -> None:
         """Precompute shape/basis and geometric terms for faster assembly.
         
@@ -146,6 +147,7 @@ class FEMSolver2D:
         self.elem_dNdx = np.zeros((self.numelem, nqp, nn, 2), dtype=float)
         self.elem_detJ = np.zeros((self.numelem, nqp), dtype=float)
 
+        #also compute J on gpu since our mesh is large it could be causing overhead?q
         for iel in range(self.numelem):
             sctrT = self.elem_sctr[iel]
             Xe = self.node[sctrT, :]
@@ -204,16 +206,18 @@ class FEMSolver2D:
     # SYSTEM ASSEMBLY
     # Core FEM assembly loop corresponding to baseline TIME-STEPPING LOOP
     # ---------------------------
+
+    # use cupy for gpu bases matmul, move away from nested loops
     def _assemble_system(self, boundary_snapshot: dict) -> tuple[sp.csr_matrix, np.ndarray, dict[int, float]]:
         """Assemble global stiffness matrix K and force vector f.
-        
+
         This implements the baseline's assembly logic:
           1. Boundary condition assembly (robin/neumann on edges)
           2. Element loop with Jacobian computation
           3. Local stiffness/capacity contributions
           4. Global sparse matrix assembly
           5. Application of Dirichlet boundary conditions
-        
+
         Corresponds to baseline: "for i in range(LeftEdge.shape[0]):" and "for iel in range(numelem):"
         """
         fT = np.zeros(self.numnode)
@@ -223,6 +227,16 @@ class FEMSolver2D:
         # Corresponds to baseline:
         #   for i in range(LeftEdge.shape[0]): ... fT_local = -N * landa_e1 * (TT - Te1) * J0 * W1[j]
         #   for i in range(TopEdge.shape[0]):  ... (same pattern)
+        #
+        # Robin BCs are treated implicitly: h*(T_new - T_env) contributes
+        #   K_robin[a,b] += h * N_a * N_b * J0 * w  (stiffness, assembled below)
+        #   fT[a]        += h * T_env * N_a * J0 * w (force)
+        # This avoids evaluating the flux from the old temperature (explicit), which
+        # can introduce inaccuracy at high h_coeff or near the phase-change front.
+        rows_r: list[int] = []
+        cols_r: list[int] = []
+        data_r: list[float] = []
+
         boundaries = boundary_snapshot.get("boundaries", [])
         for bc in boundaries:
             bc_type = bc.get("bc_type")
@@ -261,16 +275,26 @@ class FEMSolver2D:
                             continue
                         temp_k = self._to_kelvin(float(temperature))
                         h_coeff = float(h_coeff)
-                        TT = N.T @ self.T[sctr]
-                        fT_local = -N * h_coeff * (TT - temp_k) * J0 * w
+                        # Implicit: force term only carries the known T_env part;
+                        # T_new part goes into the stiffness matrix K_robin.
+                        fT_local = N * h_coeff * temp_k * J0 * w
+                        for a in range(nn):
+                            fT[sctr[a]] += fT_local[a]
+                        # K_robin contribution: h * N_a * N_b * J0 * w
+                        K_robin_local = h_coeff * np.outer(N, N) * J0 * w
+                        for a in range(nn):
+                            for b_idx in range(nn):
+                                rows_r.append(sctr[a])
+                                cols_r.append(sctr[b_idx])
+                                data_r.append(K_robin_local[a, b_idx])
                     else:
                         heat_flux = bc.get("heat_flux")
                         if heat_flux is None:
                             continue
                         qn = float(heat_flux)
                         fT_local = N * qn * J0 * w
-                    for a in range(nn):
-                        fT[sctr[a]] += fT_local[a]
+                        for a in range(nn):
+                            fT[sctr[a]] += fT_local[a]
 
         # ===== ELEMENT LOOP: Stiffness and Capacity Assembly =====
         # Assembles K (thermal conductivity) and C (heat capacity) matrices
@@ -338,7 +362,11 @@ class FEMSolver2D:
         # Convert accumulated COO triplets to CSR for efficient solving
         K_matrix = sp.coo_matrix((data_k, (rows, cols)), shape=(self.numnode, self.numnode)).tocsr()
         C_matrix = sp.coo_matrix((data_c, (rows, cols)), shape=(self.numnode, self.numnode)).tocsr()
-        A = K_matrix + (C_matrix / float(self.solver.dt_seconds))
+        if data_r:
+            K_robin = sp.coo_matrix((data_r, (rows_r, cols_r)), shape=(self.numnode, self.numnode)).tocsr()
+        else:
+            K_robin = sp.csr_matrix((self.numnode, self.numnode))
+        A = K_matrix + K_robin + (C_matrix / float(self.solver.dt_seconds))
         b = fT + (C_matrix @ self.T) / float(self.solver.dt_seconds)
         return A, b, dirichlet_map
 
@@ -364,7 +392,13 @@ class FEMSolver2D:
     # ---------------------------
     def _solve_step(self, boundary_snapshot: dict) -> None:
         """Solve a single time step using Newton iteration.
-        
+
+        The system is reassembled at each iteration so that material properties
+        (phase-change ice fraction, thermal conductivity, heat capacity) are
+        re-evaluated at the latest temperature estimate.  Without reassembly the
+        loop was a no-op: spsolve (direct) drives the linear residual to machine
+        precision in one step, so additional iterations added nothing.
+
         baseline:
           A = K_matrix + (C_matrix / dt)
           b = fT + (C_matrix @ Xn) / dt
@@ -374,18 +408,19 @@ class FEMSolver2D:
               residual = b - A @ X_new
               if norm(residual) < tol_r: converged=True
         """
-        A, b, dirichlet_map = self._assemble_system(boundary_snapshot)
-        A_bc, b_bc = self._apply_dirichlet(A, b, dirichlet_map)
-
         X_new = self.T.copy()
-        residual = b_bc - A_bc @ X_new
 
         for _ in range(self.solver.max_iterations):
-            dX = spla.spsolve(A_bc, residual)
-            X_new = X_new + dX
+            # Reassemble with the current temperature estimate so that the
+            # nonlinear material properties reflect the latest X_new.
+            self.T = X_new
+            A, b, dirichlet_map = self._assemble_system(boundary_snapshot)
+            A_bc, b_bc = self._apply_dirichlet(A, b, dirichlet_map)
             residual = b_bc - A_bc @ X_new
             if np.linalg.norm(residual) < self.solver.tol_r:
                 break
+            dX = spla.spsolve(A_bc, residual)        # replace spsolve with cuSPARSE, a faster GPU based linear solver
+            X_new = X_new + dX
 
         self.T = X_new
 

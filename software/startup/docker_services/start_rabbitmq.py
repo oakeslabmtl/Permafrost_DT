@@ -39,6 +39,8 @@ def _service_config() -> DockerServiceConfig:
         compose_directory=root / "software" / "digital_twin" / "communication" / "installation" / "rabbitmq",
         log_file=root / "logs" / "rabbitmq.log",
         healthcheck=_rabbitmq_ready,
+        max_attempts=45,
+        sleep_time=3.0,
     )
 
 
