@@ -260,7 +260,7 @@ def FEM(
 
 def main() -> None:
     params = {
-        "porosity": 0.01,
+        "porosity": 0.20,
         "rho_s": 2700.0,
         "rho_w": 1000.0,
         "rho_i": 920.0,

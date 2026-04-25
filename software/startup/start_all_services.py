@@ -12,19 +12,21 @@ but commented out so you can decide whether to trigger them.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Dict, List
+from typing import Callable
 
 from software.startup.docker_services.start_influxdb import start_docker_influxdb
 from software.startup.docker_services.start_rabbitmq import start_docker_rabbitmq
 from software.startup.service_runners import (
     build_influx_config,
-    make_boundary_condition_builder_runner,
-    make_fem_forecast_runner,
-    make_heater_actuation_runner,
-    make_observation_ingestion_2d_runner,
-    make_safety_monitor_runner,
-    make_thaw_front_reconstruction_runner,
-    make_viz_dashboard_runner,
+    initialize_service_config,
+    _observation_ingestion_2d_runner,
+    _boundary_condition_builder_runner,
+    _fem_forecast_runner,
+    _heater_actuation_runner,
+    _fem_inversion_runner,
+    _safety_monitor_runner,
+    _thaw_front_reconstruction_runner,
+    _viz_dashboard_runner,
 )
 from software.startup.utils.daemon import start_as_daemon
 from software.startup.utils.config import configure_logging, load_startup_config
@@ -36,7 +38,7 @@ def main() -> None:
     if fem_fields_dir.exists():
         for csv_file in fem_fields_dir.glob("*.csv"):
             csv_file.unlink()
-    
+
     config = load_startup_config()
 
     rabbit_cfg = config.get("rabbitmq", {})
@@ -44,76 +46,62 @@ def main() -> None:
     obs_2d_cfg = config.get("observation_ingestion_2d", {})
     bc_cfg = config.get("boundary_condition_builder", {})
     thaw_cfg = config.get("thaw_front_reconstruction", {})
+    inversion_cfg = config.get("fem_inversion", {})
     fem_cfg = config.get("fem_forecast", {})
     safety_cfg = config.get("safety_monitor", {})
     heater_cfg = config.get("heater_actuation", {})
 
     influx_defaults = build_influx_config(influx_cfg_values)
 
-    available_services: Dict[str, Callable[[], Callable[[], None]]] = {
-        "observation_ingestion_2d": lambda: make_observation_ingestion_2d_runner(
-            influx_defaults,
-            rabbit_cfg,
-            obs_2d_cfg,
-        ),
-        "boundary_condition_builder": lambda: make_boundary_condition_builder_runner(
-            rabbit_cfg,
-            bc_cfg,
-        ),
-        "thaw_front_reconstruction": lambda: make_thaw_front_reconstruction_runner(
-            influx_defaults,
-            rabbit_cfg,
-            thaw_cfg,
-        ),
-        "fem_forecast": lambda: make_fem_forecast_runner(
-            influx_defaults,
-            rabbit_cfg,
-            fem_cfg,
-        ),
-        "safety_monitor": lambda: make_safety_monitor_runner(
-            influx_defaults,
-            rabbit_cfg,
-            safety_cfg,
-        ),
-        "heater_actuation": lambda: make_heater_actuation_runner(
-            influx_defaults,
-            rabbit_cfg,
-            heater_cfg,
-        ),
-        "viz_dashboard": lambda: make_viz_dashboard_runner(),
+    # Initialize the shared config dict (works across process boundaries on both Linux and Windows)
+    config_dict = initialize_service_config(
+        influx_config=influx_defaults,
+        rabbit_cfg=rabbit_cfg,
+        obs_2d_cfg=obs_2d_cfg,
+        bc_cfg=bc_cfg,
+        thaw_cfg=thaw_cfg,
+        inversion_cfg=inversion_cfg,
+        fem_cfg=fem_cfg,
+        safety_cfg=safety_cfg,
+        heater_cfg=heater_cfg,
+    )
+
+    # Map service names to runner functions
+    available_services = {
+        "observation_ingestion_2d": _observation_ingestion_2d_runner,
+        "boundary_condition_builder": _boundary_condition_builder_runner,
+        "thaw_front_reconstruction": _thaw_front_reconstruction_runner,
+        "fem_inversion": _fem_inversion_runner,
+        "fem_forecast": _fem_forecast_runner,
+        "safety_monitor": _safety_monitor_runner,
+        "heater_actuation": _heater_actuation_runner,
+        "viz_dashboard": _viz_dashboard_runner,
     }
 
-    # observation_ingestion_2d
-    # boundary_condition_builder
-    # thaw_front_reconstruction
-    # pinn_inversion_2d
-    # fem_forecast
-    # safety_monitor
-    # heater_actuation
-    # viz_dashboard
-
-    services_to_start: List[str] = [
+    services_to_start = [
         "observation_ingestion_2d",
         "boundary_condition_builder",
         "thaw_front_reconstruction",
+        "fem_inversion",
         "fem_forecast",
-        # "safety_monitor",
-        # "heater_actuation",
+        "safety_monitor",
+        "heater_actuation",
         "viz_dashboard",
     ]
 
     # Optionally start local Docker dependencies first.
-    # start_docker_rabbitmq()
-    # start_docker_influxdb()
+    start_docker_rabbitmq()
+    start_docker_influxdb()
 
     processes = []
 
     for service_name in services_to_start:
-        factory = available_services.get(service_name)
-        if factory is None:
+        runner = available_services.get(service_name)
+        if runner is None:
             raise KeyError(f"Unknown service '{service_name}'. Available: {sorted(available_services)}")
-        runner = factory()
-        processes.append(start_as_daemon(runner, process_name=service_name))
+        processes.append(
+            start_as_daemon(runner, process_name=service_name, kwargs={"config_dict": config_dict})
+        )
 
     for process in processes:
         process.join()

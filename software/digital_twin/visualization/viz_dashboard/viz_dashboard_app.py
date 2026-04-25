@@ -243,7 +243,7 @@ def _interpolate_temperature_field(sensors: pd.DataFrame, grid_resolution: int =
 
 def _temperature_contour(
     sensors: pd.DataFrame,
-    temp_range: tuple[float, float] = (-1.0, 60.0),
+    temp_range: tuple[float, float] = (-1.0, 50.0),
     *,
     title: str = "Temperature field with thaw front (0 C)",
     marker_name: str = "Sensors",
