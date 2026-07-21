@@ -1,401 +1,418 @@
 """
-CR1000 Datalogger — Sensor Monitor (RS232) with CSV output
-===========================================================
-Connects to a Campbell Scientific CR1000 datalogger over RS232 serial,
-continuously polls live sensor readings, prints them to terminal, and
-appends each record to a CSV file.
-
-Usage:
-    python cr1000_monitor.py --port COM3 --baud 115200
-
-    Full options:
-    python cr1000_monitor.py --port COM3 --baud 115200 --table Table1
-                             --interval 2.0 --pakbus 1
-                             --output readings.csv
-
-Arguments:
-    --port      Serial port (required). Find in Device Manager -> Ports (COM & LPT)
-    --baud      Baud rate. Must match CR1000 setting (default: 115200)
-    --table     Data table name on the CR1000 (default: Table1)
-    --interval  Seconds between readings (default: 2.0)
-    --pakbus    CR1000 PakBus address (default: 1)
-    --output    CSV output file path (default: cr1000_readings.csv)
+CR1000 Monitoring Script
+---------------------------------
+Connects to a CR1000, polls for new records every POLL_INTERVAL seconds,
+and appends each new record to a CSV file.
 
 Requirements:
     pip install pycampbellcr1000
-
-Notes:
-    - PC400 must be CLOSED before running — they cannot share the same COM port
-    - CSV file is created if it does not exist, appended to if it does
-    - Each row in the CSV is one sensor snapshot with a timestamp
-    - Press Ctrl+C to stop monitoring cleanly
 """
 
-import time
-import argparse
-import sys
 import csv
+import logging
 import os
+import re
+import threading
+import time
+import traceback
 from datetime import datetime
 
-try:
-    from pycampbellcr1000 import CR1000
-except ImportError:
-    print("[ERROR] pycampbellcr1000 is not installed.")
-    print("        Run: pip install pycampbellcr1000")
-    sys.exit(1)
+from pycampbellcr1000 import CR1000
+from pycampbellcr1000.compat import is_py3
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+SERIAL_PORT     = "COM5"
+BAUD_RATE       = 115200
+TABLE_NAME      = "Table1"
+POLL_INTERVAL   = 30        # seconds between record checks
+CONNECT_TIMEOUT = 60
+CALL_TIMEOUT    = 120       # covers TDF retry worst-case
+RECONNECT_DELAY = 15        # wait before reconnecting after a failure
+CSV_FILE        = "cr1000_data.csv"
+RECORDS_PER_POLL = 3        # fetch the last N records each poll so a slow
+                            # poll backfills any skipped record (gap-free)
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+LOG_FILE = "cr1000_monitor.log"
+
+_fmt     = logging.Formatter("%(asctime)s [%(levelname)-7s] %(message)s", datefmt="%H:%M:%S")
+_console = logging.StreamHandler()
+_console.setFormatter(_fmt)
+_file    = logging.FileHandler(LOG_FILE, encoding="utf-8")
+_file.setFormatter(_fmt)
+
+log = logging.getLogger("cr1000_monitor")
+log.setLevel(logging.DEBUG)
+log.addHandler(_console)
+log.addHandler(_file)
 
 
-def log(level: str, message: str) -> None:
-    """Print a timestamped log message."""
-    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    symbols = {
-        "INFO":   "[INFO]   ",
-        "OK":     "[OK]     ",
-        "WARN":   "[WARN]   ",
-        "ERROR":  "[ERROR]  ",
-        "DATA":   "[DATA]   ",
-        "ACTION": "[ACTION] ",
-        "CSV":    "[CSV]    ",
-    }
-    prefix = symbols.get(level, "[LOG]    ")
-    print(f"  {timestamp}  {prefix} {message}")
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def call_with_timeout(fn, timeout, *args, **kwargs):
+    result = [None]
+    error  = [None]
+
+    def target():
+        try:
+            result[0] = fn(*args, **kwargs)
+        except Exception as e:
+            error[0] = e
+
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise TimeoutError(f"call timed out after {timeout}s")
+    if error[0]:
+        raise error[0]
+    return result[0]
 
 
-def connect(port: str, baud: int, pakbus: int) -> CR1000 | None:
-    """Attempt to connect to the CR1000 over RS232 serial."""
-    address = f"serial:{port}:{baud}"
-    log("INFO", f"Connecting to CR1000 on {port} at {baud} baud ...")
-    log("INFO", f"Protocol: PakBus over RS232  |  PakBus address: {pakbus}")
-
-    try:
-        device = CR1000.from_url(address, dest_addr=pakbus)
-        log("OK", "Connection established successfully")
-        return device
-    except Exception as e:
-        log("ERROR", f"Connection failed: {type(e).__name__}: {e}")
-        log("ERROR", "Troubleshooting checklist:")
-        log("ERROR", f"  1. Is the CR1000 powered ON?")
-        log("ERROR", f"  2. Is the COM port correct? (currently: {port})")
-        log("ERROR", f"  3. Does the baud rate match CR1000? (currently: {baud})")
-        log("ERROR",  "  4. Is PC400 open and using this port? Close it first.")
-        log("ERROR",  "  5. Is the RS232 cable firmly connected?")
-        log("ERROR",  "  6. Does the CR1000 have an active measurement program?")
-        return None
+def _decode_field_name(name):
+    """Decode bytes field name to str, stripping b'' wrapper."""
+    if isinstance(name, (bytes, bytearray)):
+        return name.decode("utf-8", errors="replace")
+    return str(name)
 
 
-def get_tables(device: CR1000) -> list:
-    """List all data tables available on the CR1000."""
-    log("INFO", "Fetching available data tables from CR1000...")
-    try:
-        tables = device.list_tables()
-        tables = [t.decode() if isinstance(t, bytes) else t for t in tables]
-    except Exception as e:
-        log("ERROR", f"Failed to list tables: {type(e).__name__}: {e}")
-        return []
+# Only these sensors are used by the digital twin; everything else in Table1
+# (PTemp_C, ref, VWC/EC/PA/VR moisture probes, etc.) is discarded.
+_HXDY_RE    = re.compile(r"^H\d+D\d+$")          # thermistor strings, e.g. H10D0
+_KEEP_EXACT = {"SHF", "SHF_2", "Inlet", "Outlet"}
 
 
-def get_fields(device: CR1000, table: str) -> list:
-    """List all field names in a given table."""
-    log("INFO", f"Fetching field names from table '{table}'...")
-    try:
-        fields = device.list_fields(table)
-        log("OK", f"Fields in '{table}': {', '.join(fields)}")
-        return fields
-    except Exception as e:
-        log("ERROR", f"Failed to list fields: {type(e).__name__}: {e}")
-        return []
+def _keep_field(fname):
+    """True if a Table1 field should be kept as a CSV column."""
+    name = _decode_field_name(fname)
+    return bool(_HXDY_RE.match(name)) or name in _KEEP_EXACT
 
 
-def fetch_latest(device: CR1000, table: str) -> dict | None:
-    """Fetch the most recent record from the specified table."""
-    try:
-        records = device.get_data(table, start_date=None)
-
-        if not records:
-            log("WARN", f"No records found in table '{table}'")
-            return None
-
-        raw = records[-1]
-        print("RAW RECORD:", raw)  # keep for debugging (can remove later)
-
-        cleaned = {}
-
-        for k, v in raw.items():
-            # Fix keys like "b'PTemp_C'" → "PTemp_C"
-            if isinstance(k, str) and k.startswith("b'") and k.endswith("'"):
-                k = k[2:-1]
-
-            # Optional: ensure Datetime stays clean
-            if k == "Datetime":
-                cleaned["Datetime"] = v
-            else:
-                cleaned[k] = v
-
-        return cleaned
-
-    except KeyboardInterrupt:
-        raise
-    except Exception as e:
-        log("ERROR", f"Failed to fetch data: {type(e).__name__}: {e}")
-        return None
+def _decode_row(record):
+    """Decode a fetched record's (possibly bytes) keys to str -> value."""
+    row = {}
+    for k, v in record.items():
+        key = _decode_field_name(k) if isinstance(k, (bytes, bytearray)) else str(k)
+        row[key] = v
+    return row
 
 
-def print_record(record: dict, fields: list) -> None:
-    """Pretty-print a single sensor record to terminal."""
-    print()
-    print(f"  {'─' * 50}")
-    timestamp = record.get("Datetime", "N/A")
-    print(f"  {'Timestamp':<30} {timestamp}")
-    for field in fields:
-        if field == "Datetime":
+# ---------------------------------------------------------------------------
+# TDF — fetch and log structure, return tabledef
+# ---------------------------------------------------------------------------
+def fetch_tabledef(device):
+    log.info("Fetching TDF...")
+    raw      = device.getfile('.TDF')
+    tabledef = device.pakbus.parse_tabledef(raw)
+    log.info("TDF: %d bytes, tables: %s",
+             len(raw), [_decode_field_name(t['Header']['TableName']) for t in tabledef])
+
+    for t in tabledef:
+        tname    = _decode_field_name(t['Header']['TableName'])
+        interval = t['Header'].get('TblInterval', '?')
+        log.info("  Table %r: %d fields, interval=%s", tname, len(t['Fields']), interval)
+        for i, f in enumerate(t['Fields'], 1):
+            log.debug("    [%3d] %-30s  type=%-8s  dim=%d  beg_idx=%s",
+                      i, _decode_field_name(f['FieldName']), f['FieldType'],
+                      f['Dimension'], f.get('BegIdx', 0))
+
+    return tabledef
+
+
+# ---------------------------------------------------------------------------
+# Build ordered CSV column list from TDF (mirrors parse_collectdata key logic)
+# ---------------------------------------------------------------------------
+def build_columns(tabledef):
+    tname_enc = TABLE_NAME.encode() if is_py3 else TABLE_NAME
+    t_def = next((t for t in tabledef if t['Header']['TableName'] == tname_enc), None)
+    if t_def is None:
+        raise ValueError(f"Table '{TABLE_NAME}' not found in TDF")
+
+    # Timestamp first, then one column per kept sensor label. RecNbr is tracked
+    # internally for dedup but intentionally kept out of the CSV.
+    columns = ['Timestamp']
+    for fld in t_def['Fields']:
+        fname   = fld['FieldName']
+        if not _keep_field(fname):
             continue
-        value = record.get(field, "N/A")
-        if isinstance(value, float):
-            print(f"  {field:<30} {value:.4f}")
+        beg_idx = fld.get('BegIdx', 0)
+        if beg_idx:
+            if isinstance(fname, bytes):
+                raw_key = fname + ('(%d)' % beg_idx).encode()
+            else:
+                raw_key = '%s(%d)' % (fname, beg_idx)
         else:
-            print(f"  {field:<30} {value}")
-    print(f"  {'─' * 50}")
+            raw_key = fname
+        columns.append(_decode_field_name(raw_key))
+
+    return columns
 
 
-def init_csv(output_path: str, fields: list) -> bool:
-    """
-    Initialize the CSV file. Write header row if file does not exist.
-    If file exists, append to it without rewriting the header.
-    Returns True if ready to write, False on error.
-    """
-    file_exists = os.path.isfile(output_path)
+# ---------------------------------------------------------------------------
+# Batched last-record fetch
+# ---------------------------------------------------------------------------
+def fetch_recent_records(device, tabledef):
+    tname_enc = TABLE_NAME.encode() if is_py3 else TABLE_NAME
+    tablenbr  = None
+    for i, item in enumerate(tabledef):
+        if item['Header']['TableName'] == tname_enc:
+            tablenbr = i + 1
+            break
+    if tablenbr is None:
+        raise ValueError(f"Table '{TABLE_NAME}' not found")
+
+    t_def       = tabledef[tablenbr - 1]
+    tabledefsig = t_def['Signature']
+    fields      = t_def['Fields']
+
+    DATATYPE         = device.pakbus.DATATYPE
+    MAX_RESP_PAYLOAD = 900
+    MAX_CMD_FIELDS   = 60
+
+    batches, current_batch, current_size = [], [], 8
+
+    for i, fld in enumerate(fields, 1):
+        ftype = fld['FieldType']
+        dim   = fld['Dimension']
+        if ftype == 'ASCII':
+            fsize = dim
+        elif isinstance(ftype, str) and ftype in DATATYPE and DATATYPE[ftype]['size']:
+            fsize = dim * DATATYPE[ftype]['size']
+        else:
+            fsize = dim * 4
+
+        # We request RECORDS_PER_POLL records per command, so the response
+        # carries N copies of each field — size the batch accordingly.
+        eff = fsize * RECORDS_PER_POLL
+        if (current_size + eff > MAX_RESP_PAYLOAD or len(current_batch) >= MAX_CMD_FIELDS) \
+                and current_batch:
+            batches.append(current_batch)
+            current_batch, current_size = [], 8
+        current_batch.append(i)
+        current_size += eff
+
+    if current_batch:
+        batches.append(current_batch)
+
+    log.debug("Batches: %d (%s fields each)",
+              len(batches), " | ".join(str(len(b)) for b in batches))
+
+    MAX_RETRIES = 3
+    RETRY_DELAY = 2.0
+    records     = {}   # RecNbr -> {'_RecNbr', 'Timestamp', <sensor fields>}
+
+    for bi, batch in enumerate(batches):
+        cmd = device.pakbus.get_collectdata_cmd(
+            tablenbr, tabledefsig, mode=0x05, p1=RECORDS_PER_POLL, p2=0, field_list=batch
+        )
+
+        msg = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            t0 = time.time()
+            hdr, msg, send_time = device.send_wait(cmd)
+            elapsed = time.time() - t0
+            if msg:
+                break
+            log.warning("Batch %d: no response (attempt %d/%d, %.1fs) — retrying in %.0fs",
+                        bi, attempt, MAX_RETRIES, elapsed, RETRY_DELAY)
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY)
+
+        if not msg:
+            raise RuntimeError(f"Batch {bi}: no response after {MAX_RETRIES} attempts")
+
+        resp_code = msg.get('RespCode')
+        if resp_code not in (None, 0):
+            raise RuntimeError(f"Batch {bi}: RespCode=0x{resp_code:02x}")
+
+        rec_data = msg.get('RecData')
+        if not rec_data:
+            log.warning("Batch %d: empty RecData — skipping", bi)
+            continue
+
+        data, _ = device.pakbus.parse_collectdata(rec_data, tabledef, fieldnbr=batch)
+
+        for rec in data:
+            for item in rec.get('RecFrag', []):
+                if not isinstance(item, dict):
+                    continue
+                rn = item.get('RecNbr')
+                if rn is None:
+                    continue
+                slot = records.setdefault(rn, {})
+                slot['_RecNbr']   = rn
+                slot['Timestamp'] = item.get('TimeOfRec')
+                slot.update(item.get('Fields', {}))
+
+    # Return records oldest-first so they are written in chronological order.
+    return [records[rn] for rn in sorted(records)]
+
+
+# ---------------------------------------------------------------------------
+# CSV writing
+# ---------------------------------------------------------------------------
+def read_last_timestamp():
+    """Return the Timestamp of the last row already in the CSV (or None).
+
+    Used to seed dedup so restarting the script does not re-append records
+    that were saved in a previous run."""
+    if not (os.path.isfile(CSV_FILE) and os.path.getsize(CSV_FILE) > 0):
+        return None
     try:
+        with open(CSV_FILE, newline="", encoding="utf-8") as f:
+            last = None
+            for row in csv.DictReader(f):
+                last = row.get('Timestamp')
+        if not last:
+            return None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+            try:
+                return datetime.strptime(last, fmt)
+            except ValueError:
+                continue
+        log.warning("Unrecognized timestamp format in CSV: %r", last)
+    except Exception as e:
+        log.warning("Could not read last timestamp from CSV: %s", e)
+    return None
+
+
+def write_record(record, columns):
+    file_exists = os.path.isfile(CSV_FILE) and os.path.getsize(CSV_FILE) > 0
+    with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
         if not file_exists:
-            log("CSV", f"Creating new CSV file: {output_path}")
-            with open(output_path, "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=fields)
-                writer.writeheader()
-            log("CSV", f"Header written: {', '.join(fields)}")
-        else:
-            log("CSV", f"Appending to existing CSV file: {output_path}")
-            log("CSV", f"File size before start: {os.path.getsize(output_path)} bytes")
-        return True
-    except OSError as e:
-        log("ERROR", f"Could not initialize CSV file '{output_path}': {e}")
-        log("ERROR", "Check that the directory exists and you have write permissions")
-        return False
+            writer.writeheader()
+            log.info("CSV created: %s  (%d columns)", CSV_FILE, len(columns))
+
+        # Decode bytes keys so they match the string column names; columns not
+        # in `columns` (RecNbr, discarded sensors) are dropped by extrasaction.
+        writer.writerow(_decode_row(record))
 
 
-def write_csv(output_path: str, record: dict, fields: list) -> bool:
-    """
-    Append a single record to the CSV file.
-    Returns True on success, False on error.
-    """
-    try:
-        with open(output_path, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fields)
-            row = {field: record.get(field, "") for field in fields}
-            writer.writerow(row)
-        return True
-    except OSError as e:
-        log("ERROR", f"Failed to write to CSV: {e}")
-        return False
+# ---------------------------------------------------------------------------
+# Main — outer reconnect loop + inner poll loop
+# ---------------------------------------------------------------------------
+def main():
+    log.info("=" * 60)
+    log.info("  CR1000 Monitor  |  port=%s  baud=%d  table=%s  interval=%ds",
+             SERIAL_PORT, BAUD_RATE, TABLE_NAME, POLL_INTERVAL)
+    log.info("=" * 60)
 
-
-def test_connection(device: CR1000, table: str) -> bool:
-    """Verify connection by listing tables and fetching one record."""
-    log("INFO", "Running connection test...")
-
-    log("INFO", f"Trying direct read from table '{table}' (bypassing list_tables)...")
-
-    record = fetch_latest(device, table)
-    if record is None:
-        log("ERROR", "Could not fetch a record from table — communication issue or empty table")
-        return False
-
-    log("OK", "Direct read worked — table exists and data is accessible")
-    return True
-
-    # if table not in tables:
-    #     log("WARN", f"Table '{table}' not found on device")
-    #     log("WARN", f"Available tables: {', '.join(tables)}")
-    #     log("WARN",  "Use --table to specify the correct table name from the list above")
-    #     return False
-
-    # log("INFO", f"Fetching one test record from table '{table}'...")
-    # record = fetch_latest(device, table)
-    # if record is None:
-    #     log("ERROR", "Could not fetch a record — table may be empty")
-    #     return False
-
-    # log("OK", "Connection test PASSED — CR1000 is live and returning data")
-    # return True
-
-
-def monitor(device: CR1000, table: str, fields: list,
-            interval: float, output_path: str) -> None:
-    """
-    Main polling loop — fetches latest record every interval seconds,
-    prints to terminal and appends to CSV.
-    """
-    log("INFO", f"Starting live monitoring of table '{table}'")
-    log("INFO", f"Poll interval: {interval}s")
-    log("INFO", f"CSV output: {os.path.abspath(output_path)}")
-    log("INFO", "Press Ctrl+C to stop")
-    print()
-
-    reading_count = 0
-    error_count   = 0
-    csv_error     = False
-    last_timestamp = None
-    fields_initialized = False
-
-    # Optional: remove old CSV to avoid bad headers
-    if os.path.exists(output_path):
-        os.remove(output_path)
-        log("CSV", f"Removed old CSV file: {output_path}")
+    last_rec_nbr = None
+    last_dt      = read_last_timestamp()
+    if last_dt is not None:
+        log.info("Resuming after last saved row at %s", last_dt)
 
     while True:
-        log("ACTION", f"Fetching latest record from '{table}'...")
-        record = fetch_latest(device, table)
-
-        if record:
-            ts = record.get("Datetime")
-
-            # Skip duplicate timestamps
-            if ts == last_timestamp:
-                time.sleep(interval)
-                continue
-
-            last_timestamp = ts
-            reading_count += 1
-            error_count   = 0
-
-            # 🔥 Initialize fields dynamically from first valid record
-            if not fields_initialized:
-                fields.clear()
-
-                # Optional: exclude RecNbr if you don’t want it
-                detected_fields = [k for k in record.keys() if k != "RecNbr"]
-
-                # Ensure Datetime is first
-                fields.extend(["Datetime"] + [f for f in detected_fields if f != "Datetime"])
-
-                log("INFO", f"Detected fields: {', '.join(fields)}")
-
-                # Initialize CSV with correct header
-                if not init_csv(output_path, fields):
-                    log("ERROR", "Failed to initialize CSV with detected fields")
-                    return
-
-                fields_initialized = True
-
-            log("DATA", f"Record #{reading_count} received")
-            print_record(record, fields)
-
-            # Write to CSV
-            if not csv_error:
-                success = write_csv(output_path, record, fields)
-                if success:
-                    log("CSV", f"Record #{reading_count} written to {output_path}")
-                else:
-                    csv_error = True
-                    log("WARN", "CSV writing disabled due to repeated errors")
-                    log("WARN", "Data is still being printed to terminal")
-
-        else:
-            error_count += 1
-            log("WARN", f"No data returned — failed reads: {error_count}")
-
-            if error_count >= 5:
-                log("ERROR", "5 consecutive failed reads — check CR1000 connection")
-                log("ERROR", "Stopping monitor. Restart script to reconnect.")
-                break
+        device   = None
+        tabledef = None
+        columns  = None
 
         try:
-            time.sleep(interval)
+            # ── Connect ────────────────────────────────────────────────────
+            log.info("Connecting to %s @ %d baud...", SERIAL_PORT, BAUD_RATE)
+            t0     = time.time()
+            device = call_with_timeout(
+                CR1000.from_url, CONNECT_TIMEOUT,
+                f"serial:{SERIAL_PORT}:{BAUD_RATE}"
+            )
+            log.info("Connected in %.1fs", time.time() - t0)
+
+            tabledef = call_with_timeout(fetch_tabledef, CALL_TIMEOUT, device)
+            columns  = build_columns(tabledef)
+            log.info("Column order (%d cols): %s ... %s",
+                     len(columns), columns[:4], columns[-2:])
+
+            # ── Poll loop ──────────────────────────────────────────────────
+            while True:
+                t0 = time.time()
+
+                try:
+                    recs = call_with_timeout(fetch_recent_records, CALL_TIMEOUT, device, tabledef)
+                except Exception as e:
+                    log.error("Fetch failed: %s — reconnecting", e)
+                    log.debug(traceback.format_exc())
+                    break   # exit inner loop → reconnect
+
+                # Keep records newer than what we've already written (by RecNbr
+                # within a run, by Timestamp across restarts), in ascending order.
+                #
+                # The batched fetch is NOT atomic: each batch requests the most
+                # recent N records independently, so a batch delayed by a retry
+                # can see a newer window than the others. Merging then leaves the
+                # edge record covered by only some batches (a partial row). Only
+                # emit records that every batch fully populated; stop at the first
+                # incomplete one so we never write past a gap — it'll be complete
+                # on the next poll.
+                kept     = columns[1:]        # sensor columns (Timestamp excluded)
+                expected = len(kept)
+                new      = []
+                deferred = None
+                for r in recs:
+                    rn, ts = r['_RecNbr'], r.get('Timestamp')
+                    if ts is None:
+                        continue
+                    if last_rec_nbr is not None and rn <= last_rec_nbr:
+                        continue
+                    if last_dt is not None and ts <= last_dt:
+                        continue
+                    # Count only the kept columns; a dropped batch leaves some of
+                    # them missing even though other (discarded) fields arrived.
+                    row     = _decode_row(r)
+                    nfields = sum(1 for c in kept if row.get(c) is not None)
+                    if nfields < expected:
+                        deferred = (rn, nfields)
+                        break
+                    new.append(r)
+
+                if not recs:
+                    log.warning("No record returned")
+                elif not new:
+                    if deferred:
+                        log.info("Poll: record #%s incomplete (%d/%d fields) — deferring to next poll",
+                                 deferred[0], deferred[1], expected)
+                    else:
+                        log.info("Poll: no new data (record #%s)", recs[-1]['_RecNbr'])
+                else:
+                    for r in new:
+                        write_record(r, columns)
+                        last_rec_nbr = r['_RecNbr']
+                        last_dt      = r['Timestamp']
+                    tail = ("  (deferring #%s: %d/%d fields)" % (deferred[0], deferred[1], expected)
+                            if deferred else "")
+                    log.info("Wrote %d new record(s)  |  latest #%s  |  %s  |  %.1fs fetch%s",
+                             len(new), last_rec_nbr, last_dt, time.time() - t0, tail)
+
+                # Sleep for the remainder of the poll interval
+                elapsed = time.time() - t0
+                sleep_s = max(0.0, POLL_INTERVAL - elapsed)
+                log.debug("Sleeping %.1fs until next poll", sleep_s)
+                time.sleep(sleep_s)
+
+        except TimeoutError as e:
+            log.error("TIMEOUT: %s", e)
         except KeyboardInterrupt:
-            raise
+            log.info("Stopped by user.")
+            return
+        except Exception as e:
+            log.error("ERROR: %s", e)
+            log.debug(traceback.format_exc())
+        finally:
+            if device:
+                try:
+                    device.bye()
+                    log.debug("Bye sent")
+                except Exception:
+                    pass
+                device = None
 
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="CR1000 datalogger live sensor monitor over RS232 with CSV output"
-    )
-    parser.add_argument(
-        "--port",
-        required=True,
-        help="Serial port. Windows: COM3, COM4. Linux: /dev/ttyUSB0"
-    )
-    parser.add_argument(
-        "--baud",
-        type=int,
-        default=115200,
-        help="Baud rate — must match CR1000 setting (default: 115200)"
-    )
-    parser.add_argument(
-        "--table",
-        default="Table1",
-        help="Data table name on the CR1000 (default: Table1)"
-    )
-    parser.add_argument(
-        "--interval",
-        type=float,
-        default=2.0,
-        help="Poll interval in seconds (default: 2.0)"
-    )
-    parser.add_argument(
-        "--pakbus",
-        type=int,
-        default=1,
-        help="CR1000 PakBus address (default: 1)"
-    )
-    parser.add_argument(
-        "--output",
-        default="cr1000_readings.csv",
-        help="CSV output file path (default: cr1000_readings.csv)"
-    )
-    args = parser.parse_args()
-
-    print()
-    print("=" * 55)
-    print("  CR1000 Datalogger — Sensor Monitor (RS232)")
-    print("=" * 55)
-    log("INFO", f"Port: {args.port}  |  Baud: {args.baud}  |  "
-               f"Table: {args.table}  |  PakBus: {args.pakbus}")
-    log("INFO", f"Poll interval: {args.interval}s")
-    log("INFO", f"Output CSV: {os.path.abspath(args.output)}")
-    log("WARN", "Make sure PC400 is CLOSED before running this script")
-
-    # Connect
-    device = connect(args.port, args.baud, args.pakbus)
-    if device is None:
-        log("ERROR", "Exiting due to failed connection")
-        sys.exit(1)
-
-    # Test connection
-    if not test_connection(device, args.table):
-        log("ERROR", "Exiting due to failed connection test")
-        sys.exit(1)
-
-    # Get fields
-    fields = get_fields(device, args.table)
-    if not fields:
-        log("WARN", "Could not retrieve field names — will print raw records")
-        fields = ["Datetime"]
-
-    # Initialize CSV
-    if not init_csv(args.output, fields):
-        log("ERROR", "Exiting due to CSV initialization failure")
-        sys.exit(1)
-
-    print()
-
-    # Start monitoring
-    try:
-        monitor(device, args.table, fields, args.interval, args.output)
-    except KeyboardInterrupt:
-        print()
-        log("INFO", "Monitoring stopped by user (Ctrl+C)")
-        log("INFO", f"CSV saved to: {os.path.abspath(args.output)}")
-        log("OK",   "Goodbye.")
-        sys.exit(0)
+        log.info("Reconnecting in %ds...\n", RECONNECT_DELAY)
+        time.sleep(RECONNECT_DELAY)
 
 
 if __name__ == "__main__":
