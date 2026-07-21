@@ -13,3 +13,18 @@ software/models/pinn_forward/freezing_soil_pinn_history.json
 .pytest_cache/
 .mypy_cache/
 .cache/
+
+# Local agent / editor config
+.claude/
+
+# Local data, exports and runtime outputs (never commit measurement data)
+data/
+artifacts/
+*.log
+cr1000_data*.csv
+timeseries_*.csv
+timeseries_*.json
+software/tools/heat_data.txt
+
+# Generated packaging metadata
+permafrost_dt.egg-info/
