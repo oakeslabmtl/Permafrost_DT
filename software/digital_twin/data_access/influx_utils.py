@@ -334,13 +334,10 @@ class InfluxHelper:
         time_hours: float,
         radius_max_m: float | None,
         radius_avg_m: float | None,
+        radius_min_m: float | None = None,
+        thaw_volume_m3: float | None = None,
         points: Sequence[dict[str, float]],
-        contour_found: bool | None = None,
-        contour_state: str | None = None,
-        contour_point_count: int | None = None,
-        proxy_radius_max_m: float | None = None,
-        proxy_radius_avg_m: float | None = None,
-        proxy_point_count: int | None = None,
+        point_count: int | None = None,
         site: str = "default",
     ) -> None:
         """Persist thaw front metrics and representative points."""
@@ -351,26 +348,26 @@ class InfluxHelper:
 
         timestamp = datetime.datetime.utcnow()
 
+        # NOTE: measurement is "thaw_front_metrics_v2". The original
+        # "thaw_front_metrics" name became unwritable in the InfluxDB bucket — a
+        # stale field-type conflict got registered in the series index, so every
+        # write to that exact measurement name was silently dropped (accepted
+        # with HTTP 204 but never persisted), which blanked the safety gauge and
+        # all radius/volume/diagnostics plots. Deleting the data and restarting
+        # InfluxDB did not clear the index entry, so the measurement was renamed.
         metrics = (
-            Point("thaw_front_metrics")
+            Point("thaw_front_metrics_v2")
             .tag("site_id", site)
             .field("time_hours", float(time_hours))
             .field("radius_max_m", float(radius_max_m) if radius_max_m is not None else float("nan"))
             .field("radius_avg_m", float(radius_avg_m) if radius_avg_m is not None else float("nan"))
+            .field("radius_min_m", float(radius_min_m) if radius_min_m is not None else float("nan"))
             .time(timestamp, write_precision=WritePrecision.NS)
         )
-        if contour_state is not None:
-            metrics = metrics.tag("contour_state", str(contour_state))
-        if contour_found is not None:
-            metrics = metrics.field("contour_found", bool(contour_found))
-        if contour_point_count is not None:
-            metrics = metrics.field("contour_point_count", int(contour_point_count))
-        if proxy_radius_max_m is not None:
-            metrics = metrics.field("proxy_radius_max_m", float(proxy_radius_max_m))
-        if proxy_radius_avg_m is not None:
-            metrics = metrics.field("proxy_radius_avg_m", float(proxy_radius_avg_m))
-        if proxy_point_count is not None:
-            metrics = metrics.field("proxy_point_count", int(proxy_point_count))
+        if thaw_volume_m3 is not None:
+            metrics = metrics.field("thaw_volume_m3", float(thaw_volume_m3))
+        if point_count is not None:
+            metrics = metrics.field("point_count", int(point_count))
 
         records = [metrics]
         for idx, point in enumerate(points, start=1):
@@ -472,19 +469,32 @@ class InfluxHelper:
         triggered: bool,
         reason: str,
         metric: str,
+        status: str | None = None,
+        r_max_m: float | None = None,
+        r_min_m: float | None = None,
+        limit_min_radius_m: float | None = None,
+        rmin_below_floor: bool | None = None,
+        recommended_action: str | None = None,
         site: str = "default",
     ) -> None:
-        """Persist safety alert status for downstream monitoring."""
+        """Persist safety alert status for downstream monitoring.
+
+        ``status`` may be a graded level (``ok``/``warning``/``critical``/``alert``);
+        when omitted it falls back to the binary ``alert``/``ok`` derived from
+        ``triggered`` (legacy single-metric mode). The dual-limit rule engine also
+        records r_max/r_min, the min-radius floor and the recommended heater action.
+        """
 
         if self.write_api is None:  # pragma: no cover - runtime fallback
             self.logger.warning("Influx write skipped (no client available) for measurement safety_alerts")
             return
 
+        status_tag = status or ("alert" if triggered else "ok")
         timestamp = datetime.datetime.utcnow()
         record = (
             Point("safety_alerts")
             .tag("site_id", site)
-            .tag("status", "alert" if triggered else "ok")
+            .tag("status", status_tag)
             .tag("reason", reason)
             .tag("metric", metric)
             .field("time_hours", float(time_hours))
@@ -494,6 +504,16 @@ class InfluxHelper:
             .field("triggered", bool(triggered))
             .time(timestamp, write_precision=WritePrecision.NS)
         )
+        if r_max_m is not None:
+            record = record.field("r_max_m", float(r_max_m))
+        if r_min_m is not None:
+            record = record.field("r_min_m", float(r_min_m))
+        if limit_min_radius_m is not None:
+            record = record.field("limit_min_radius_m", float(limit_min_radius_m))
+        if rmin_below_floor is not None:
+            record = record.field("rmin_below_floor", bool(rmin_below_floor))
+        if recommended_action is not None:
+            record = record.tag("recommended_action", recommended_action)
 
         try:
             self.write_api.write(bucket=self.bucket, record=[record])
@@ -505,7 +525,7 @@ class InfluxHelper:
             self.logger.info(
                 "safety_alerts write complete (t=%.2fh, status=%s)",
                 float(time_hours),
-                "alert" if triggered else "ok",
+                status_tag,
             )
             self._logged_measurements.add("safety_alerts")
 
@@ -656,7 +676,7 @@ class InfluxHelper:
             return pd.DataFrame()
 
         if isinstance(tables, list) and tables:
-            df = tables[0]
+            df = pd.concat(tables, ignore_index=True)
         elif isinstance(tables, pd.DataFrame):
             df = tables
         else:
@@ -758,8 +778,9 @@ class InfluxHelper:
     ) -> pd.DataFrame:
         """Fetch thaw-front radius metrics."""
 
+        # Renamed from "thaw_front_metrics" — see write_thaw_front_metrics for why.
         return self._query_measurement(
-            "thaw_front_metrics",
+            "thaw_front_metrics_v2",
             site=site,
             limit=limit,
             range_start=range_start,
@@ -840,6 +861,110 @@ class InfluxHelper:
 
         return self._query_measurement(
             "heater_actions",
+            site=site,
+            limit=limit,
+            range_start=range_start,
+        )
+
+    def write_fluid_temperatures(
+        self,
+        *,
+        time_hours: float,
+        t_inlet_c: float,
+        t_outlet_c: float,
+        site: str = "default",
+    ) -> None:
+        """Persist fluid inlet/outlet temperatures for energy metric computation."""
+
+        if self.write_api is None:  # pragma: no cover - runtime fallback
+            self.logger.warning("Influx write skipped (no client available) for measurement fluid_temperatures")
+            return
+
+        timestamp = datetime.datetime.utcnow()
+        record = (
+            Point("fluid_temperatures")
+            .tag("site_id", site)
+            .field("time_hours", float(time_hours))
+            .field("t_inlet_c", float(t_inlet_c))
+            .field("t_outlet_c", float(t_outlet_c))
+            .time(timestamp, write_precision=WritePrecision.NS)
+        )
+        try:
+            self.write_api.write(bucket=self.bucket, record=[record])
+        except Exception as exc:  # pragma: no cover - runtime infra
+            self.logger.error("Error writing fluid temperatures to InfluxDB: %s", exc)
+
+    def query_fluid_temperatures(
+        self,
+        *,
+        site: str = "default",
+        limit: int = 5000,
+        range_start: str = "-12h",
+    ) -> pd.DataFrame:
+        """Fetch fluid inlet/outlet temperature history."""
+
+        return self._query_measurement(
+            "fluid_temperatures",
+            site=site,
+            limit=limit,
+            range_start=range_start,
+        )
+
+    def write_pipe_calibration(
+        self,
+        parameters: dict[str, float],
+        *,
+        rmse: float | None = None,
+        mae: float | None = None,
+        interface_temperature_c: float | None = None,
+        site: str = "default",
+        timestamp: datetime.datetime | None = None,
+    ) -> None:
+        """Persist calibrated pipe (heat-exchanger loop) parameters + fit metrics."""
+
+        if not parameters:
+            return
+
+        if self.write_api is None:  # pragma: no cover - runtime fallback
+            self.logger.warning("Influx write skipped (no client available) for measurement pipe_calibration")
+            return
+
+        timestamp = timestamp or datetime.datetime.utcnow()
+        record = Point("pipe_calibration").tag("site_id", site)
+        for key, value in parameters.items():
+            try:
+                record = record.field(key, float(value))
+            except (TypeError, ValueError):
+                self.logger.warning("Skipping invalid pipe parameter %s=%s", key, value)
+        for key, value in (
+            ("rmse", rmse),
+            ("mae", mae),
+            ("interface_temperature_c", interface_temperature_c),
+        ):
+            if value is None:
+                continue
+            try:
+                record = record.field(key, float(value))
+            except (TypeError, ValueError):
+                self.logger.debug("Skipping invalid pipe metric %s=%s", key, value)
+        record = record.time(timestamp, write_precision=WritePrecision.NS)
+
+        try:
+            self.write_api.write(bucket=self.bucket, record=[record])
+        except Exception as exc:  # pragma: no cover - runtime infra
+            self.logger.error("Error writing pipe calibration to InfluxDB: %s", exc)
+
+    def query_pipe_calibration(
+        self,
+        *,
+        site: str = "default",
+        limit: int = 200,
+        range_start: str = "-90d",
+    ) -> pd.DataFrame:
+        """Fetch recorded pipe calibration parameter sets."""
+
+        return self._query_measurement(
+            "pipe_calibration",
             site=site,
             limit=limit,
             range_start=range_start,
