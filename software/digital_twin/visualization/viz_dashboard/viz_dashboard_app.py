@@ -11,8 +11,10 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 from plotly.subplots import make_subplots
+from scipy.integrate import cumulative_trapezoid
 from scipy.interpolate import griddata
 
 ROOT_DIR = Path(__file__).resolve().parents[4]
@@ -30,6 +32,9 @@ THERMOSYPHON_RADIUS_M = 0.0075
 
 SAFE_PCT_DEFAULT = 0.80
 CAUTION_PCT_DEFAULT = 0.95
+
+_MAX_ANIMATION_FRAMES = 40   # hard cap on Plotly frames sent to browser
+_ANIMATION_GRID_RES   = 80   # lower grid resolution for animation (vs 120 for static)
 
 
 # -----------------------------
@@ -205,6 +210,29 @@ def _build_safety_gauge(r_max: float | None, limit_m: float, safe_pct: float, ca
     return fig
 
 
+def _extend_constant_along_r(field: np.ndarray) -> np.ndarray:
+    """Forward-fill NaNs along +r (axis 1), holding the outermost finite value.
+
+    Extends each depth row's last in-coverage temperature outward to the domain
+    edge, so the uncovered r-band (sensors stop at ~165 mm; the domain runs to
+    240 mm) takes the value of the outermost sensor column at that depth. This is
+    a horizontal (constant-in-r) hold — consistent with the insulated, zero
+    radial-flux right boundary — rather than 2-D nearest-neighbour extrapolation,
+    which smeared edge sensors into false corner blobs. Leading NaNs (no data at
+    smaller r) and all-NaN rows are left untouched.
+    """
+    filled = field.copy()
+    col_idx = np.arange(filled.shape[1])
+    # For each cell, the index of the last valid column at or before it (-1 = none).
+    last = np.where(~np.isnan(filled), col_idx[None, :], -1)
+    np.maximum.accumulate(last, axis=1, out=last)
+    rows = np.arange(filled.shape[0])[:, None]
+    gathered = filled[rows, np.where(last >= 0, last, 0)]
+    replace = np.isnan(filled) & (last >= 0)
+    filled[replace] = gathered[replace]
+    return filled
+
+
 def _interpolate_temperature_field(sensors: pd.DataFrame, grid_resolution: int = 120) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
     if sensors is None or sensors.empty:
         return None
@@ -232,18 +260,33 @@ def _interpolate_temperature_field(sensors: pd.DataFrame, grid_resolution: int =
 
     if T is None:
         return None
+
+    # Coverage mask: linear interpolation returns NaN *exactly* outside the
+    # convex hull of the sensors. We use that as a "where do we actually have
+    # data" mask so the field is never extrapolated in 2-D into uncovered
+    # regions (sensors stop at r~165 mm but the domain runs to 240 mm).
+    # Previously those cells were back-filled with 2-D nearest-neighbour, which
+    # smeared an edge sensor's value into large false warm/cold corner blobs.
+    coverage = griddata(points, temp, (R, Z), method="linear")
+
+    # Fill interior holes of the (possibly cubic) field with nearest, then
+    # re-apply the coverage mask so nothing outside the sensor hull survives.
     if np.isnan(T).any():
         T_near = griddata(points, temp, (R, Z), method="nearest")
         T = np.where(np.isnan(T), T_near, T)
-    if np.isnan(T).any():
-        T = np.nan_to_num(T, nan=float(np.nanmin(temp)))
+    T = np.where(np.isnan(coverage), np.nan, T)
+
+    # Extend the outermost sensor column outward in r (constant-temperature hold)
+    # so the uncovered r-band mirrors the r~165 mm reading at each depth, instead
+    # of being left blank — matches the insulated (zero radial-flux) boundary.
+    T = _extend_constant_along_r(T)
 
     return R, Z, T
 
 
 def _temperature_contour(
     sensors: pd.DataFrame,
-    temp_range: tuple[float, float] = (-1.0, 50.0),
+    temp_range: tuple[float, float] = (-5.0, 30.0),
     *,
     title: str = "Temperature field with thaw front (0 C)",
     marker_name: str = "Sensors",
@@ -267,6 +310,7 @@ def _temperature_contour(
             zmid=0.0,
             colorbar={"title": "Temperature (C)", "tick0": temp_range[0], "dtick": 5},
             contours={"showlines": False},
+            connectgaps=False,
         )
     )
 
@@ -279,6 +323,7 @@ def _temperature_contour(
             contours={"start": 0.0, "end": 0.0, "coloring": "lines"},
             line={"color": "#111827", "width": 3},
             name="Thaw front (0 C)",
+            connectgaps=False,
         )
     )
 
@@ -322,6 +367,202 @@ def _temperature_contour(
         yaxis_title="Depth (mm)",
         height=440,
         margin=dict(l=40, r=20, t=50, b=40),
+    )
+    fig.update_yaxes(autorange="reversed")
+    fig.update_xaxes(range=[0, DOMAIN_RADIUS_M * 1000.0])
+    fig.update_yaxes(range=[DOMAIN_DEPTH_M * 1000.0, 0.0])
+    return fig
+
+
+def _temperature_contour_animated(
+    sensors: pd.DataFrame,
+    temp_range: tuple[float, float] = (-1.0, 50.0),
+    *,
+    title: str = "Temperature field — heat propagation",
+    marker_name: str = "Sensors",
+    max_frames: int = _MAX_ANIMATION_FRAMES,
+    grid_resolution: int = _ANIMATION_GRID_RES,
+) -> go.Figure | None:
+    """Animated Plotly figure with a play button and scrubber over all timesteps.
+
+    Payload is kept manageable by:
+    - Capping frames at max_frames (subsampled uniformly from available timesteps).
+    - Using a lower grid resolution than the static version.
+    - Passing only `z` in each frame for the two Contour traces (x/y are fixed on
+      the base trace and are not retransmitted per frame).
+    """
+    if sensors is None or sensors.empty or "time_hours" not in sensors.columns:
+        return None
+
+    all_times = np.sort(sensors["time_hours"].dropna().unique())
+    if len(all_times) == 0:
+        return None
+    if len(all_times) == 1:
+        # Single snapshot — fall back to the lighter static version.
+        return _temperature_contour(sensors, temp_range, title=title, marker_name=marker_name)
+
+    # --- subsample timesteps -------------------------------------------
+    n_total = len(all_times)
+    if n_total > max_frames:
+        indices = np.round(np.linspace(0, n_total - 1, max_frames)).astype(int)
+        sampled_times = all_times[indices]
+    else:
+        sampled_times = all_times
+
+    # Fixed grid axes (computed once, shared by every frame).
+    r_grid = np.linspace(0.0, DOMAIN_RADIUS_M, grid_resolution)
+    z_grid = np.linspace(0.0, DOMAIN_DEPTH_M, grid_resolution)
+    R, Z_mesh = np.meshgrid(r_grid, z_grid)
+    x_axis = (R[0, :] * 1000.0).tolist()
+    y_axis = (Z_mesh[:, 0] * 1000.0).tolist()
+
+    # --- build per-frame data -----------------------------------------
+    frame_entries: list[dict] = []
+    for t in sampled_times:
+        snapshot = sensors[np.isclose(sensors["time_hours"], t)].copy()
+        if snapshot.empty:
+            continue
+        field = _interpolate_temperature_field(snapshot, grid_resolution=grid_resolution)
+        if field is None:
+            continue
+        _, _, T = field
+        snap = snapshot.dropna(subset=["x_m", "z_m", "temperature"]).copy()
+        snap["x_m"] = snap["x_m"].astype(float).abs()
+        frame_entries.append({
+            "t": float(t),
+            "z": T.tolist(),                                    # 2-D list, not numpy
+            "sx": (snap["x_m"] * 1000.0).tolist(),
+            "sz": (snap["z_m"] * 1000.0).tolist(),
+            "sc": snap["temperature"].astype(float).tolist(),
+            "sid": snap["sensor_id"].astype(str).tolist() if "sensor_id" in snap.columns else [],
+        })
+
+    if not frame_entries:
+        return None
+
+    first = frame_entries[0]
+
+    # --- base figure (first timestep) ----------------------------------
+    fig = go.Figure()
+
+    fig.add_trace(go.Contour(
+        x=x_axis, y=y_axis, z=first["z"],
+        colorscale="Jet",
+        zmin=temp_range[0], zmax=temp_range[1], zmid=0.0,
+        colorbar={"title": "°C", "tick0": temp_range[0], "dtick": 10},
+        contours={"showlines": False},
+        connectgaps=False,
+        name="Temperature",
+    ))
+
+    fig.add_trace(go.Contour(
+        x=x_axis, y=y_axis, z=first["z"],
+        showscale=False,
+        contours={"start": 0.0, "end": 0.0, "coloring": "lines"},
+        line={"color": "#111827", "width": 3},
+        name="Thaw front (0 °C)",
+        connectgaps=False,
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=first["sx"], y=first["sz"],
+        mode="markers",
+        marker={
+            "size": 8,
+            "color": first["sc"],
+            "colorscale": "Jet",
+            "cmin": temp_range[0], "cmax": temp_range[1],
+            "line": {"width": 0.5, "color": "#0f172a"},
+        },
+        name=marker_name,
+        hovertemplate="Sensor %{text}<br>Temp: %{marker.color:.2f} °C<extra></extra>",
+        text=first["sid"],
+    ))
+
+    fig.add_shape(
+        type="rect",
+        x0=0.0, x1=THERMOSYPHON_RADIUS_M * 1000.0,
+        y0=0.0, y1=DOMAIN_DEPTH_M * 1000.0,
+        fillcolor="#111827", opacity=0.6, line_width=0, layer="below",
+    )
+
+    # --- animation frames (only z changes for the two Contour traces) --
+    frames = []
+    for fe in frame_entries:
+        frames.append(go.Frame(
+            data=[
+                go.Contour(z=fe["z"]),           # updates trace 0 — only z
+                go.Contour(z=fe["z"]),           # updates trace 1 — only z
+                go.Scatter(                      # updates trace 2 — positions + colour
+                    x=fe["sx"], y=fe["sz"],
+                    marker={"color": fe["sc"]},
+                    text=fe["sid"],
+                ),
+            ],
+            traces=[0, 1, 2],
+            name=f"{fe['t']:.4f}",
+        ))
+    fig.frames = frames
+
+    # --- scrubber slider -----------------------------------------------
+    slider_steps = [
+        {
+            "args": [
+                [f.name],
+                {"frame": {"duration": 350, "redraw": True},
+                 "mode": "immediate",
+                 "transition": {"duration": 0}},
+            ],
+            "label": f"{float(f.name):.2f}h",
+            "method": "animate",
+        }
+        for f in frames
+    ]
+
+    n_sampled = len(frame_entries)
+    subsampled = n_sampled < n_total
+    subtitle = f"{n_sampled} frames" + (f" (1 of every {n_total // n_sampled} snapshots)" if subsampled else "")
+
+    fig.update_layout(
+        title={"text": f"{title}<br><sup>{subtitle}</sup>"},
+        xaxis_title="Radial distance (mm)",
+        yaxis_title="Depth (mm)",
+        height=500,
+        margin=dict(l=40, r=20, t=60, b=100),
+        updatemenus=[{
+            "type": "buttons",
+            "showactive": False,
+            "x": 0.0, "y": -0.18,
+            "xanchor": "left", "yanchor": "top",
+            "buttons": [
+                {
+                    "label": "▶  Play",
+                    "method": "animate",
+                    "args": [None, {"frame": {"duration": 350, "redraw": True},
+                                    "fromcurrent": True,
+                                    "transition": {"duration": 0}}],
+                },
+                {
+                    "label": "⏸  Pause",
+                    "method": "animate",
+                    "args": [[None], {"frame": {"duration": 0, "redraw": False},
+                                      "mode": "immediate",
+                                      "transition": {"duration": 0}}],
+                },
+            ],
+        }],
+        sliders=[{
+            "active": 0,
+            "pad": {"t": 50, "b": 10},
+            "currentvalue": {
+                "prefix": "t = ",
+                "suffix": " h",
+                "font": {"size": 13},
+                "visible": True,
+                "xanchor": "center",
+            },
+            "steps": slider_steps,
+        }],
     )
     fig.update_yaxes(autorange="reversed")
     fig.update_xaxes(range=[0, DOMAIN_RADIUS_M * 1000.0])
@@ -456,13 +697,21 @@ def _unified_radius_plot(
     forecast_metrics: pd.DataFrame,
     heater_actions: pd.DataFrame,
     limit_m: float,
+    limit_min_m: float = 0.0,
+    warn_fraction: float = 0.6,
+    critical_fraction: float = 0.9,
 ) -> go.Figure | None:
     if thaw_metrics is None or thaw_metrics.empty:
         return None
 
     df_measured = thaw_metrics.copy()
+    if "time_hours" not in df_measured.columns or "radius_max_m" not in df_measured.columns:
+        return None
     df_measured["time_hours"] = _safe_float_series(df_measured["time_hours"])
     df_measured["radius_max_m"] = _safe_float_series(df_measured["radius_max_m"])
+    has_rmin = "radius_min_m" in df_measured.columns
+    if has_rmin:
+        df_measured["radius_min_m"] = _safe_float_series(df_measured["radius_min_m"])
     df_measured = df_measured.dropna(subset=["time_hours", "radius_max_m"]).sort_values("time_hours")
 
     if len(df_measured) > 200:
@@ -480,6 +729,20 @@ def _unified_radius_plot(
             hovertemplate="Time: %{x:.2f}h<br>r_max: %{y:.3f}m<extra></extra>",
         )
     )
+
+    if has_rmin:
+        df_rmin = df_measured.dropna(subset=["radius_min_m"])
+        if not df_rmin.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=df_rmin["time_hours"],
+                    y=df_rmin["radius_min_m"],
+                    mode="lines",
+                    line={"color": "#17becf", "width": 3},
+                    name="Measured r_min",
+                    hovertemplate="Time: %{x:.2f}h<br>r_min: %{y:.3f}m<extra></extra>",
+                )
+            )
 
     if forecast_metrics is not None and not forecast_metrics.empty and "horizon_hours" in forecast_metrics.columns:
         df_forecast = forecast_metrics.copy()
@@ -505,7 +768,7 @@ def _unified_radius_plot(
         y=limit_m,
         line_width=4,
         line_color="#b91c1c",
-        annotation_text=f"SAFETY LIMIT ({limit_m:.3f}m)",
+        annotation_text=f"LIMIT MAX ({limit_m:.3f}m)",
         annotation_position="top right",
     )
 
@@ -518,16 +781,80 @@ def _unified_radius_plot(
         line_width=0,
     )
 
+    # Warning / critical bands as r_max approaches LIMIT MAX. These mirror the
+    # safety_monitor's graded statuses: [warn, critical)*limit -> warning,
+    # [critical, 1)*limit -> critical. The heater keeps thawing through both;
+    # only crossing LIMIT MAX stops it.
+    warn_y = warn_fraction * limit_m
+    crit_y = critical_fraction * limit_m
+    if 0.0 < warn_y < crit_y < limit_m:
+        fig.add_hrect(
+            y0=warn_y,
+            y1=crit_y,
+            fillcolor="rgba(234,179,8,0.10)",
+            line_width=0,
+        )
+        fig.add_hrect(
+            y0=crit_y,
+            y1=limit_m,
+            fillcolor="rgba(249,115,22,0.14)",
+            line_width=0,
+        )
+        fig.add_hline(
+            y=warn_y,
+            line_width=1.5,
+            line_dash="dot",
+            line_color="#eab308",
+            annotation_text=f"WARN ({warn_fraction*100:.0f}% = {warn_y:.3f}m)",
+            annotation_position="top left",
+            annotation_font_color="#eab308",
+        )
+        fig.add_hline(
+            y=crit_y,
+            line_width=1.5,
+            line_dash="dot",
+            line_color="#f97316",
+            annotation_text=f"CRITICAL ({critical_fraction*100:.0f}% = {crit_y:.3f}m)",
+            annotation_position="top left",
+            annotation_font_color="#f97316",
+        )
+
+    if limit_min_m > 0:
+        fig.add_hline(
+            y=limit_min_m,
+            line_width=4,
+            line_color="#2563eb",
+            annotation_text=f"LIMIT MIN ({limit_min_m:.3f}m)",
+            annotation_position="bottom right",
+        )
+        fig.add_hrect(
+            y0=0.0,
+            y1=limit_min_m,
+            fillcolor="rgba(37,99,235,0.10)",
+            line_width=0,
+        )
+
     latest_time = float(df_measured["time_hours"].iloc[-1])
     latest_r = float(df_measured["radius_max_m"].iloc[-1])
+    if latest_r >= limit_m:
+        zone_label, zone_color = "ALERT (heater STOP)", "#ef4444"
+    elif latest_r >= crit_y:
+        zone_label, zone_color = "CRITICAL (heating)", "#f97316"
+    elif latest_r >= warn_y:
+        zone_label, zone_color = "WARNING (heating)", "#eab308"
+    else:
+        zone_label, zone_color = "OK (heating)", "#22c55e"
     fig.add_trace(
         go.Scatter(
             x=[latest_time],
             y=[latest_r],
             mode="markers",
-            name="Current r_max",
-            marker=dict(size=14, color="#1f77b4", line=dict(width=2, color="white")),
-            hovertemplate=f"NOW<br>Time: {latest_time:.2f}h<br>r_max: {latest_r:.3f}m<extra></extra>",
+            name=f"Current r_max — {zone_label}",
+            marker=dict(size=16, color=zone_color, line=dict(width=2, color="white")),
+            hovertemplate=(
+                f"NOW — {zone_label}<br>Time: {latest_time:.2f}h<br>"
+                f"r_max: {latest_r:.3f}m<extra></extra>"
+            ),
         )
     )
 
@@ -560,6 +887,176 @@ def _unified_radius_plot(
     return fig
 
 
+def _volume_over_time_plot(thaw_metrics: pd.DataFrame) -> go.Figure | None:
+    if thaw_metrics is None or thaw_metrics.empty:
+        return None
+    if "thaw_volume_m3" not in thaw_metrics.columns:
+        return None
+
+    df = thaw_metrics.copy()
+    df["time_hours"] = _safe_float_series(df["time_hours"])
+    df["thaw_volume_m3"] = _safe_float_series(df["thaw_volume_m3"])
+    df = df.dropna(subset=["time_hours", "thaw_volume_m3"]).sort_values("time_hours")
+    if df.empty:
+        return None
+
+    if len(df) > 200:
+        step = max(int(len(df) / 200), 1)
+        df = df.iloc[::step].copy()
+
+    vol_cm3 = df["thaw_volume_m3"] * 1e6
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df["time_hours"],
+        y=vol_cm3,
+        mode="lines",
+        line={"color": "#7c3aed", "width": 3},
+        name="Thaw volume",
+        hovertemplate="Time: %{x:.2f}h<br>Volume: %{y:.2f} cm³<extra></extra>",
+    ))
+
+    latest_time = float(df["time_hours"].iloc[-1])
+    latest_vol = float(vol_cm3.iloc[-1])
+    fig.add_trace(go.Scatter(
+        x=[latest_time],
+        y=[latest_vol],
+        mode="markers",
+        name="Current",
+        marker=dict(size=14, color="#7c3aed", line=dict(width=2, color="white")),
+        hovertemplate=f"NOW<br>Time: {latest_time:.2f}h<br>Volume: {latest_vol:.2f} cm³<extra></extra>",
+    ))
+
+    fig.update_layout(
+        title="Thaw volume over time",
+        height=400,
+        margin=dict(l=70, r=50, t=70, b=70),
+        legend=dict(
+            x=1.02, y=0.02, xanchor="left", yanchor="bottom",
+            bgcolor="rgba(15,23,42,0.65)",
+            bordercolor="rgba(148,163,184,0.6)",
+            borderwidth=1,
+            font=dict(size=11, color="#e2e8f0"),
+        ),
+        hovermode="x unified",
+        plot_bgcolor="rgba(15,23,42,0.08)",
+        paper_bgcolor="rgba(15,23,42,0.02)",
+        font=dict(color="#e2e8f0"),
+    )
+    fig.update_xaxes(title_text="Time (hours)", showgrid=True, gridcolor="rgba(148,163,184,0.25)")
+    fig.update_yaxes(title_text="Thaw volume (cm³)", showgrid=True, gridcolor="rgba(148,163,184,0.25)")
+    return fig
+
+
+def _thaw_volume_3d_plot(thaw_points: pd.DataFrame) -> go.Figure | None:
+    if thaw_points is None or thaw_points.empty:
+        return None
+    required = {"time_hours", "x_m", "z_m"}
+    if not required.issubset(thaw_points.columns):
+        return None
+
+    df = thaw_points.copy()
+    df["time_hours"] = _safe_float_series(df["time_hours"])
+    df["x_m"] = _safe_float_series(df["x_m"]).abs()
+    df["z_m"] = _safe_float_series(df["z_m"])
+    df = df.dropna(subset=["time_hours", "x_m", "z_m"])
+    if df.empty:
+        return None
+
+    t = float(df["time_hours"].max())
+    df = df[np.isclose(df["time_hours"], t, atol=1e-9)].copy()
+    df = df.sort_values("z_m").drop_duplicates(subset=["z_m"])
+    if len(df) < 2:
+        return None
+
+    # Densify contour to a uniform z grid for a smooth surface
+    z_raw = df["z_m"].to_numpy()
+    r_raw = df["x_m"].to_numpy()
+    z_dense = np.linspace(float(z_raw[0]), float(z_raw[-1]), 120)
+    r_dense = np.interp(z_dense, z_raw, r_raw)
+
+    # Convert to mm for display
+    z_mm = z_dense * 1000.0
+    r_mm = r_dense * 1000.0
+    pipe_r_mm = THERMOSYPHON_RADIUS_M * 1000.0
+
+    # Angular sweep
+    n_theta = 72
+    theta = np.linspace(0, 2 * np.pi, n_theta)
+
+    THETA, Z_mesh = np.meshgrid(theta, z_mm)
+    R_mesh = np.tile(r_mm[:, np.newaxis], (1, n_theta))
+    X_outer = R_mesh * np.cos(THETA)
+    Y_outer = R_mesh * np.sin(THETA)
+
+    fig = go.Figure()
+
+    # Outer thaw surface — coloured by depth
+    fig.add_trace(go.Surface(
+        x=X_outer, y=Y_outer, z=Z_mesh,
+        surfacecolor=Z_mesh,
+        colorscale="Blues",
+        reversescale=True,
+        opacity=0.72,
+        showscale=False,
+        name="Thaw boundary",
+        hovertemplate="x: %{x:.1f} mm<br>y: %{y:.1f} mm<br>z: %{z:.1f} mm<extra>Thaw boundary</extra>",
+    ))
+
+    # Top cap (disc at shallowest depth)
+    r_cap = np.linspace(pipe_r_mm, r_mm[0], 30)
+    THETA_c, R_c = np.meshgrid(theta, r_cap)
+    fig.add_trace(go.Surface(
+        x=R_c * np.cos(THETA_c),
+        y=R_c * np.sin(THETA_c),
+        z=np.full_like(R_c, z_mm[0]),
+        colorscale=[[0, "#3b82f6"], [1, "#3b82f6"]],
+        showscale=False, opacity=0.72,
+        name="Top cap",
+    ))
+
+    # Bottom cap (disc at deepest depth)
+    r_cap_b = np.linspace(pipe_r_mm, r_mm[-1], 30)
+    THETA_cb, R_cb = np.meshgrid(theta, r_cap_b)
+    fig.add_trace(go.Surface(
+        x=R_cb * np.cos(THETA_cb),
+        y=R_cb * np.sin(THETA_cb),
+        z=np.full_like(R_cb, z_mm[-1]),
+        colorscale=[[0, "#3b82f6"], [1, "#3b82f6"]],
+        showscale=False, opacity=0.72,
+        name="Bottom cap",
+    ))
+
+    # Heating pipe (dark inner cylinder)
+    z_pipe = np.linspace(z_mm[0], z_mm[-1], 40)
+    THETA_p, Z_p = np.meshgrid(theta, z_pipe)
+    fig.add_trace(go.Surface(
+        x=pipe_r_mm * np.cos(THETA_p),
+        y=pipe_r_mm * np.sin(THETA_p),
+        z=Z_p,
+        colorscale=[[0, "#1e293b"], [1, "#334155"]],
+        showscale=False, opacity=1.0,
+        name="Heating pipe",
+    ))
+
+    fig.update_layout(
+        title=f"3D thaw volume  (t = {t:.2f} h)",
+        height=560,
+        margin=dict(l=0, r=0, t=50, b=0),
+        scene=dict(
+            xaxis_title="x (mm)",
+            yaxis_title="y (mm)",
+            zaxis_title="Depth (mm)",
+            zaxis=dict(autorange="reversed"),
+            aspectmode="data",
+            bgcolor="rgba(241,245,249,0.0)",
+            camera=dict(eye=dict(x=1.6, y=1.6, z=0.8)),
+        ),
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
+
+
 def _model_diagnostics_plot(
     thaw_metrics: pd.DataFrame,
     forecast_metrics: pd.DataFrame,
@@ -569,6 +1066,8 @@ def _model_diagnostics_plot(
         return None
 
     measured = thaw_metrics.copy()
+    if "time_hours" not in measured.columns or "radius_max_m" not in measured.columns:
+        return None
     measured["time_hours"] = _safe_float_series(measured["time_hours"]).round(2)
     measured["radius_max_m"] = _safe_float_series(measured["radius_max_m"])
     measured = measured.dropna(subset=["time_hours", "radius_max_m"])
@@ -637,17 +1136,178 @@ def _model_diagnostics_plot(
     return fig
 
 
+_SEVERITY_LEVEL = {"ok": 0, "warning": 1, "critical": 2, "alert": 3}
+_SEVERITY_COLOR = {
+    "ok": "#22c55e",
+    "warning": "#eab308",
+    "critical": "#f97316",
+    "alert": "#ef4444",
+}
+
+
 def _alerts_series(df: pd.DataFrame) -> go.Figure | None:
     if df is None or df.empty or "time_hours" not in df.columns:
         return None
-    fig = px.scatter(
-        df,
-        x="time_hours",
-        y="triggered",
-        color="status" if "status" in df.columns else None,
-        title="Safety alert timeline",
+
+    plot_df = df.copy()
+    plot_df["time_hours"] = _safe_float_series(plot_df["time_hours"])
+
+    # Graded severity: with the dual-limit rule engine, status ranges over
+    # ok/warning/critical/alert. Map to an ordinal level so warnings are visible
+    # as their own tier instead of collapsing onto the triggered 0/1 axis. Fall
+    # back to triggered for legacy single-metric alerts that only emit alert/ok.
+    if "status" in plot_df.columns:
+        status = plot_df["status"].astype(str).str.lower()
+    elif "triggered" in plot_df.columns:
+        status = plot_df["triggered"].map(lambda t: "alert" if bool(t) else "ok")
+    else:
+        return None
+    plot_df["status"] = status
+    plot_df["severity"] = status.map(_SEVERITY_LEVEL).fillna(0)
+    plot_df = plot_df.dropna(subset=["time_hours"]).sort_values("time_hours")
+    if plot_df.empty:
+        return None
+
+    fig = go.Figure()
+    for level_name in ("ok", "warning", "critical", "alert"):
+        sub = plot_df[plot_df["status"] == level_name]
+        if sub.empty:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=sub["time_hours"],
+                y=sub["severity"],
+                mode="markers",
+                name=level_name,
+                marker=dict(size=9, color=_SEVERITY_COLOR[level_name]),
+                hovertemplate=f"{level_name}<br>t=%{{x:.2f}}h<extra></extra>",
+            )
+        )
+    fig.update_layout(
+        title="Safety status timeline",
+        height=280,
+        xaxis_title="time (hours)",
+        showlegend=True,
     )
-    fig.update_layout(height=280, xaxis_title="time (hours)", yaxis_title="triggered")
+    fig.update_yaxes(
+        title_text="severity",
+        tickmode="array",
+        tickvals=[0, 1, 2, 3],
+        ticktext=["ok", "warning", "critical", "alert"],
+        range=[-0.5, 3.5],
+    )
+    return fig
+
+
+_RHO_FLUID = 1110.0
+_CP_FLUID  = 2400.0
+_V_DOT     = 0.5 / 1000 / 60   # m³/s  (0.5 L/min)
+_RHO_ICE   = 917.0
+_ICE_FRAC  = 0.39
+_LF        = 334_000.0
+
+
+def _compute_energy_metrics(
+    fluid_temps: pd.DataFrame,
+    thaw_metrics: pd.DataFrame,
+) -> dict | None:
+    if fluid_temps is None or fluid_temps.empty:
+        return None
+    required = {"time_hours", "t_inlet_c", "t_outlet_c"}
+    if not required <= set(fluid_temps.columns):
+        return None
+
+    df = fluid_temps.copy()
+    df["time_hours"] = _safe_float_series(df["time_hours"])
+    df["t_inlet_c"] = _safe_float_series(df["t_inlet_c"])
+    df["t_outlet_c"] = _safe_float_series(df["t_outlet_c"])
+    df = df.dropna(subset=list(required)).sort_values("time_hours")
+    if len(df) < 2:
+        return None
+
+    t_h = df["time_hours"].to_numpy()
+    t_s = t_h * 3600.0
+    Q = np.clip(
+        _RHO_FLUID * _V_DOT * _CP_FLUID * (df["t_inlet_c"].to_numpy() - df["t_outlet_c"].to_numpy()),
+        0.0, None,
+    )
+    Ein = np.concatenate([[0.0], cumulative_trapezoid(Q, t_s)])
+
+    V_thaw = None
+    if thaw_metrics is not None and not thaw_metrics.empty and "thaw_volume_m3" in thaw_metrics.columns:
+        tm = thaw_metrics.copy()
+        tm["time_hours"] = _safe_float_series(tm["time_hours"])
+        tm["thaw_volume_m3"] = _safe_float_series(tm["thaw_volume_m3"])
+        tm = tm.dropna(subset=["time_hours", "thaw_volume_m3"]).sort_values("time_hours")
+        if not tm.empty:
+            V_thaw = np.interp(t_h, tm["time_hours"].to_numpy(), tm["thaw_volume_m3"].to_numpy())
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        if V_thaw is not None:
+            Er  = np.where(V_thaw > 1e-9, Ein / V_thaw / 1e6, np.nan)
+            eta = np.where(Ein > 0, _RHO_ICE * _ICE_FRAC * V_thaw * _LF / Ein * 100.0, np.nan)
+        else:
+            Er  = np.full_like(Ein, np.nan)
+            eta = np.full_like(Ein, np.nan)
+
+    return {"t_h": t_h, "Ein": Ein, "V_thaw": V_thaw, "Er": Er, "eta": eta}
+
+
+def _energy_ein_vs_vthaw(metrics: dict) -> go.Figure | None:
+    V_thaw = metrics.get("V_thaw")
+    if V_thaw is None:
+        return None
+    fig = go.Figure(go.Scatter(
+        x=V_thaw * 1000.0, y=metrics["Ein"] / 1e6,
+        mode="lines", line={"color": "#38bdf8", "width": 2},
+    ))
+    fig.update_layout(
+        title="Cumulative energy input vs thaw volume",
+        xaxis_title="V_thaw (L)", yaxis_title="E_in (MJ)",
+        height=400, margin=dict(l=60, r=20, t=50, b=50),
+    )
+    return fig
+
+
+def _energy_specific(metrics: dict) -> go.Figure:
+    fig = go.Figure(go.Scatter(
+        x=metrics["t_h"], y=metrics["Er"],
+        mode="lines", line={"color": "#fb923c", "width": 2},
+    ))
+    fig.update_layout(
+        title="Specific energy consumption",
+        xaxis_title="Time (h)", yaxis_title="E_r (MJ/m³)",
+        height=400, margin=dict(l=60, r=20, t=50, b=50),
+    )
+    return fig
+
+
+def _energy_vthaw_time(metrics: dict) -> go.Figure | None:
+    V_thaw = metrics.get("V_thaw")
+    if V_thaw is None:
+        return None
+    fig = go.Figure(go.Scatter(
+        x=metrics["t_h"], y=V_thaw * 1000.0,
+        mode="lines", line={"color": "#4ade80", "width": 2},
+    ))
+    fig.update_layout(
+        title="Thaw volume over time",
+        xaxis_title="Time (h)", yaxis_title="V_thaw (L)",
+        height=400, margin=dict(l=60, r=20, t=50, b=50),
+    )
+    return fig
+
+
+def _energy_eta(metrics: dict) -> go.Figure:
+    fig = go.Figure(go.Scatter(
+        x=metrics["t_h"], y=metrics["eta"],
+        mode="lines", line={"color": "#a78bfa", "width": 2},
+    ))
+    fig.update_layout(
+        title="Melting efficiency",
+        xaxis_title="Time (h)", yaxis_title="η_melt (%)",
+        height=400, margin=dict(l=60, r=20, t=50, b=50),
+    )
     return fig
 
 
@@ -688,6 +1348,71 @@ def _apply_theme() -> None:
     )
 
 
+# Distinct colors for inverted-parameter trajectories.
+_PARAM_COLORS = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf"]
+
+
+def _inverted_parameters_plot(
+    inversion: pd.DataFrame,
+    param_names: Iterable[str],
+) -> go.Figure | None:
+    """Evolution of the FEM-inverted soil parameters over time.
+
+    One stacked subplot per parameter, sharing the time axis. Parameters span
+    very different magnitudes (e.g. porosity ~0.4 vs. cap_s ~1e3), so each gets
+    its own y-axis rather than a shared overlay. Values are the absolute inverted
+    quantities written by fem_inversion (base x scale); the config's
+    ``relative_bounds`` live in scale space and are intentionally not drawn here.
+
+    The x-axis is Influx ingest time (the inversion record carries no
+    ``time_hours`` field), which for a replay advances monotonically with the run.
+    """
+    if inversion is None or inversion.empty or "_time" not in inversion.columns:
+        return None
+
+    present = [p for p in param_names if p in inversion.columns]
+    if not present:
+        return None
+
+    df = inversion.copy()
+    df["_time"] = pd.to_datetime(df["_time"], errors="coerce")
+    df = df.dropna(subset=["_time"]).sort_values("_time")
+    if df.empty:
+        return None
+
+    fig = make_subplots(
+        rows=len(present),
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.07,
+        subplot_titles=present,
+    )
+    for idx, param in enumerate(present, start=1):
+        color = _PARAM_COLORS[(idx - 1) % len(_PARAM_COLORS)]
+        fig.add_trace(
+            go.Scatter(
+                x=df["_time"],
+                y=_safe_float_series(df[param]),
+                mode="lines+markers",
+                line={"color": color, "width": 2},
+                marker={"size": 5, "color": color},
+                name=param,
+                showlegend=False,
+                hovertemplate=f"{param}: %{{y:.4g}}<br>%{{x|%H:%M:%S}}<extra></extra>",
+            ),
+            row=idx,
+            col=1,
+        )
+    fig.update_xaxes(title_text="Time (UTC ingest)", row=len(present), col=1)
+    fig.update_layout(
+        title="Inverted soil parameters - evolution",
+        height=max(280, 210 * len(present)),
+        margin=dict(l=70, r=40, t=70, b=60),
+        showlegend=False,
+    )
+    return fig
+
+
 # -----------------------------
 # Main app
 # -----------------------------
@@ -700,8 +1425,12 @@ def main() -> None:
     max_points = int(viz_cfg.get("max_points", 3000))
     refresh_seconds = int(viz_cfg.get("refresh_seconds", 20))
     r_limit = float(viz_cfg.get("r_limit_m", safety_cfg.get("limit_radius_m", 0.1)))
+    r_limit_min = float(viz_cfg.get("r_limit_min_m", safety_cfg.get("limit_min_radius_m", 0.0)))
+    warn_fraction = float(viz_cfg.get("warn_fraction", safety_cfg.get("warn_fraction", 0.6)))
+    critical_fraction = float(viz_cfg.get("critical_fraction", safety_cfg.get("critical_fraction", 0.9)))
     safe_pct = float(viz_cfg.get("safe_pct", SAFE_PCT_DEFAULT))
     caution_pct = float(viz_cfg.get("caution_pct", CAUTION_PCT_DEFAULT))
+    invert_params = list(config.get("fem_inversion", {}).get("invert_params", ["porosity", "lambda_thawed", "cap_s"]))
 
     st.title("Permafrost Digital Twin - Live Dashboard")
     st.caption("Safety-first monitoring, FEM forecasting, and control actions.")
@@ -713,10 +1442,20 @@ def main() -> None:
         max_points = st.slider("Max points", 500, 12000, max_points, 500)
         refresh_seconds = st.slider("Refresh every (seconds)", 5, 120, refresh_seconds, 5)
         st.divider()
-        r_limit = st.number_input("Safety limit r_limit (m)", min_value=0.01, max_value=1.0, value=r_limit, step=0.01)
+        r_limit = st.number_input("Limit max r_limit (m)", min_value=0.01, max_value=1.0, value=r_limit, step=0.01)
+        r_limit_min = st.number_input(
+            "Limit min r_limit_min (m)", min_value=0.0, max_value=float(r_limit), value=min(r_limit_min, float(r_limit)), step=0.01
+        )
         safe_pct = st.slider("Safe threshold (%)", 60, 90, int(safe_pct * 100), 1) / 100.0
         caution_pct = st.slider("Alert threshold (%)", 85, 99, int(caution_pct * 100), 1) / 100.0
         forecast_horizon_min = st.slider("Forecast horizon (minutes)", 5, 120, 30, 5)
+        st.divider()
+        animate_field = st.checkbox(
+            "Animate temperature field",
+            value=False,
+            help=f"Plays a scrubber over the last {_MAX_ANIMATION_FRAMES} sampled snapshots. "
+                 "Disable for a lighter page load.",
+        )
         if st.button("Refresh now"):
             st.cache_data.clear()
             if hasattr(st, "rerun"):
@@ -724,6 +1463,40 @@ def main() -> None:
             else:  # pragma: no cover - backward compatibility
                 st.experimental_rerun()
         st.caption("Tip: increase refresh interval if Influx is slow.")
+        st.divider()
+        st.markdown("**Danger zone**")
+        if st.button("Wipe all InfluxDB data", type="primary"):
+            st.session_state["_confirm_wipe"] = True
+        if st.session_state.get("_confirm_wipe"):
+            st.warning("Permanently deletes ALL data from the bucket. Cannot be undone.")
+            wipe_col1, wipe_col2 = st.columns(2)
+            with wipe_col1:
+                if st.button("Confirm", type="primary"):
+                    influx_cfg = config.get("influxdb", {})
+                    try:
+                        resp = requests.post(
+                            f"{influx_cfg.get('url', 'http://localhost:8086')}/api/v2/delete"
+                            f"?org={influx_cfg.get('org', 'permafrost')}&bucket={influx_cfg.get('bucket', 'permafrost_data')}",
+                            headers={
+                                "Authorization": f"Token {influx_cfg.get('token', 'permafrost')}",
+                                "Content-Type": "application/json",
+                            },
+                            json={"start": "1970-01-01T00:00:00Z", "stop": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")},
+                            timeout=10,
+                        )
+                        if resp.status_code == 204:
+                            st.session_state["_confirm_wipe"] = False
+                            st.cache_data.clear()
+                            st.success("Data wiped.")
+                            st.rerun()
+                        else:
+                            st.error(f"Delete failed: HTTP {resp.status_code}")
+                    except Exception as exc:
+                        st.error(f"Error: {exc}")
+            with wipe_col2:
+                if st.button("Cancel"):
+                    st.session_state["_confirm_wipe"] = False
+                    st.rerun()
 
     @st.cache_data(ttl=refresh_seconds)
     def _fetch_data(site_id: str, history_hours: float, max_points: int) -> dict[str, pd.DataFrame]:
@@ -770,6 +1543,16 @@ def main() -> None:
                 limit=max_points,
                 range_start=range_start,
             ),
+            "fluid_temperatures": influx.query_fluid_temperatures(
+                site=site_id,
+                limit=max_points,
+                range_start=range_start,
+            ),
+            "inversion": influx.query_inversion_parameters(
+                site=site_id,
+                limit=max_points,
+                range_start=range_start,
+            ),
         }
         influx.close()
         return data
@@ -784,6 +1567,7 @@ def main() -> None:
     heater_actions = data["heater_actions"]
 
     current_r_max = _latest_value(thaw_metrics, "radius_max_m")
+    current_volume_m3 = _latest_value(thaw_metrics, "thaw_volume_m3")
     current_percent = _percent(current_r_max or 0.0, r_limit) if current_r_max is not None else 0.0
     remaining_margin = None if current_r_max is None else max(r_limit - current_r_max, 0.0)
 
@@ -806,7 +1590,7 @@ def main() -> None:
         safety_state = "STOPPED"
 
     alert_forecast_minutes = None
-    if forecast_metrics is not None and not forecast_metrics.empty and "horizon_hours" in forecast_metrics.columns:
+    if forecast_metrics is not None and not forecast_metrics.empty and "horizon_hours" in forecast_metrics.columns and "radius_max_m" in forecast_metrics.columns:
         df_forecast = forecast_metrics.copy()
         df_forecast["time_hours"] = _safe_float_series(df_forecast["time_hours"])
         df_forecast["horizon_hours"] = _safe_float_series(df_forecast["horizon_hours"])
@@ -821,132 +1605,240 @@ def main() -> None:
                     now_time = float(thaw_metrics["time_hours"].max()) if thaw_metrics is not None and not thaw_metrics.empty else 0.0
                     alert_forecast_minutes = max((breach_time - now_time) * 60.0, 0.0)
 
-    if alert_forecast_minutes is not None:
-        st.markdown(
-            f"<div class='banner banner-warning'><strong>FORECAST:</strong> Limit breach predicted in "
-            f"{alert_forecast_minutes:.0f} minutes. Recommended action: stop or reduce heating.</div>",
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            "<div class='banner banner-info'><strong>Forecast:</strong> No breach predicted within the current horizon.</div>",
-            unsafe_allow_html=True,
-        )
+    tab_overview, tab_fields, tab_thaw, tab_params, tab_energy = st.tabs(
+        ["Overview & Safety", "Temperature Fields", "Thaw Front", "Model Parameters", "Energy Analysis"]
+    )
 
-    top_left, top_right = st.columns((1.2, 1))
-    with top_left:
-        st.plotly_chart(_build_safety_gauge(current_r_max, r_limit, safe_pct, caution_pct), use_container_width=True)
-        if current_r_max is not None:
-            st.caption(
-                f"r_max = {current_r_max:.3f} m | {current_percent:.0f}% of limit | "
-                f"margin: {remaining_margin:.3f} m"
+    with tab_overview:
+        if alert_forecast_minutes is not None:
+            st.markdown(
+                f"<div class='banner banner-warning'><strong>FORECAST:</strong> Limit breach predicted in "
+                f"{alert_forecast_minutes:.0f} minutes. Recommended action: stop or reduce heating.</div>",
+                unsafe_allow_html=True,
             )
         else:
-            st.caption("r_max not available yet.")
+            st.markdown(
+                "<div class='banner banner-info'><strong>Forecast:</strong> No breach predicted within the current horizon.</div>",
+                unsafe_allow_html=True,
+            )
 
-    with top_right:
-        if safety_state == "SAFE":
-            badge_class = "status-safe"
-        elif safety_state == "CAUTION":
-            badge_class = "status-caution"
-        elif safety_state == "ALERT":
-            badge_class = "status-alert"
-        else:
-            badge_class = "status-stopped"
-        st.markdown(f"<div class='status-badge {badge_class}'>SYSTEM STATUS: {safety_state}</div>", unsafe_allow_html=True)
-        st.markdown(f"**Heater action:** {last_action} at {last_action_time}")
-        if ttl_level == "danger":
-            st.error(ttl_text)
-        elif ttl_level == "caution":
-            st.warning(ttl_text)
-        else:
-            st.success(ttl_text)
-        st.caption(f"Last updated: {datetime.utcnow().strftime('%H:%M:%S UTC')}")
+        top_left, top_right = st.columns((1.2, 1))
+        with top_left:
+            st.plotly_chart(_build_safety_gauge(current_r_max, r_limit, safe_pct, caution_pct), use_container_width=True)
+            if current_r_max is not None:
+                volume_str = f" | volume: {current_volume_m3 * 1e6:.1f} cm³" if current_volume_m3 is not None else ""
+                st.caption(
+                    f"r_max = {current_r_max:.3f} m | {current_percent:.0f}% of limit | "
+                    f"margin: {remaining_margin:.3f} m{volume_str}"
+                )
+            else:
+                st.caption("r_max not available yet.")
 
-    st.divider()
+        with top_right:
+            if safety_state == "SAFE":
+                badge_class = "status-safe"
+            elif safety_state == "CAUTION":
+                badge_class = "status-caution"
+            elif safety_state == "ALERT":
+                badge_class = "status-alert"
+            else:
+                badge_class = "status-stopped"
+            st.markdown(f"<div class='status-badge {badge_class}'>SYSTEM STATUS: {safety_state}</div>", unsafe_allow_html=True)
+            st.markdown(f"**Heater action:** {last_action} at {last_action_time}")
+            if ttl_level == "danger":
+                st.error(ttl_text)
+            elif ttl_level == "caution":
+                st.warning(ttl_text)
+            else:
+                st.success(ttl_text)
+            st.caption(f"Last updated: {datetime.utcnow().strftime('%H:%M:%S UTC')}")
 
-    temp_left, temp_right = st.columns((1, 1))
-    with temp_left:
-        fig = _temperature_contour(data["sensors"])
+        st.divider()
+
+        bottom_left, bottom_right = st.columns((1, 1))
+        with bottom_left:
+            fig = _alerts_series(safety_alerts)
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No safety alerts yet.")
+        with bottom_right:
+            if heater_actions is not None and not heater_actions.empty:
+                st.subheader("Heater actions")
+                display_actions = heater_actions.tail(20).copy()
+                keep_cols = [col for col in ["time_hours", "action", "reason", "setpoint", "triggered"] if col in display_actions.columns]
+                display_actions = display_actions[keep_cols]
+                if "time_hours" in display_actions.columns:
+                    display_actions["time_hours"] = display_actions["time_hours"].apply(
+                        lambda val: f"{float(val):.2f}" if val is not None else ""
+                    )
+                if "setpoint" in display_actions.columns:
+                    display_actions["setpoint"] = display_actions["setpoint"].apply(
+                        lambda val: f"{float(val):.2f}" if val is not None else ""
+                    )
+                st.dataframe(display_actions, use_container_width=True, hide_index=True)
+            else:
+                st.info("No heater actions yet.")
+
+    with tab_fields:
+        temp_left, temp_right = st.columns((1, 1))
+        with temp_left:
+            fig = (
+                _temperature_contour_animated(data["sensors"])
+                if animate_field
+                else _temperature_contour(data["sensors"])
+            )
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No sensor snapshots yet.")
+        with temp_right:
+            forecast_field_fig = (
+                _temperature_contour_animated(
+                    data["forecast_temperature"],
+                    title="Forecasted temperature field — heat propagation",
+                    marker_name="Forecast samples",
+                )
+                if animate_field
+                else _temperature_contour(
+                    data["forecast_temperature"],
+                    title="Forecasted temperature field with thaw front (0 C)",
+                    marker_name="Forecast samples",
+                )
+            )
+            if forecast_field_fig:
+                st.plotly_chart(forecast_field_fig, use_container_width=True)
+            else:
+                st.info("No forecasted temperature field snapshots yet.")
+
+        fig = _front_geometry_plot(data["thaw_points"], data["forecast_points"], r_limit, data["sensors"])
         if fig:
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("No sensor snapshots yet.")
-    with temp_right:
-        forecast_field_fig = _temperature_contour(
-            data["forecast_temperature"],
-            title="Forecasted temperature field with thaw front (0 C)",
-            marker_name="Forecast samples",
+            st.info("No thaw-front points yet.")
+
+        with st.expander("3D thaw volume", expanded=False):
+            fig = _thaw_volume_3d_plot(data["thaw_points"])
+            if fig:
+                st.plotly_chart(fig, use_container_width=True, key="thaw_3d")
+            else:
+                st.info("No thaw-front points yet.")
+
+    with tab_thaw:
+        fig = _unified_radius_plot(
+            thaw_metrics,
+            forecast_metrics,
+            heater_actions,
+            r_limit,
+            r_limit_min,
+            warn_fraction,
+            critical_fraction,
         )
-        if forecast_field_fig:
-            st.plotly_chart(forecast_field_fig, use_container_width=True)
-        else:
-            st.info("No forecasted temperature field snapshots yet.")
-
-    fig = _front_geometry_plot(data["thaw_points"], data["forecast_points"], r_limit, data["sensors"])
-    if fig:
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No thaw-front points yet.")
-
-    st.divider()
-
-    fig = _unified_radius_plot(thaw_metrics, forecast_metrics, heater_actions, r_limit)
-    if fig:
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No thaw-front metrics yet.")
-
-    diagnostics = _model_diagnostics_plot(thaw_metrics, forecast_metrics)
-    if diagnostics:
-        st.plotly_chart(diagnostics, use_container_width=True)
-    else:
-        st.info("No model validation metrics yet.")
-
-    bottom_left, bottom_right = st.columns((1, 1))
-    with bottom_left:
-        fig = _alerts_series(safety_alerts)
         if fig:
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("No safety alerts yet.")
-    with bottom_right:
-        if heater_actions is not None and not heater_actions.empty:
-            st.subheader("Heater actions")
-            display_actions = heater_actions.tail(20).copy()
-            keep_cols = [col for col in ["time_hours", "action", "reason", "setpoint", "triggered"] if col in display_actions.columns]
-            display_actions = display_actions[keep_cols]
-            if "time_hours" in display_actions.columns:
-                display_actions["time_hours"] = display_actions["time_hours"].apply(
-                    lambda val: f"{float(val):.2f}" if val is not None else ""
-                )
-            if "setpoint" in display_actions.columns:
-                display_actions["setpoint"] = display_actions["setpoint"].apply(
-                    lambda val: f"{float(val):.2f}" if val is not None else ""
-                )
-            st.dataframe(display_actions, use_container_width=True, hide_index=True)
+            st.info("No thaw-front metrics yet.")
+
+        fig = _volume_over_time_plot(thaw_metrics)
+        if fig:
+            st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("No heater actions yet.")
+            st.info("No thaw volume data yet.")
 
-    st.divider()
+        diagnostics = _model_diagnostics_plot(thaw_metrics, forecast_metrics)
+        if diagnostics:
+            st.plotly_chart(diagnostics, use_container_width=True)
+        else:
+            st.info("No model validation metrics yet.")
 
-    export_col1, export_col2 = st.columns(2)
-    with export_col1:
-        if thaw_metrics is not None and not thaw_metrics.empty:
+        st.divider()
+
+        export_col1, export_col2 = st.columns(2)
+        with export_col1:
+            if thaw_metrics is not None and not thaw_metrics.empty:
+                st.download_button(
+                    "Download measured metrics CSV",
+                    thaw_metrics.to_csv(index=False).encode("utf-8"),
+                    file_name="thaw_metrics.csv",
+                    mime="text/csv",
+                )
+        with export_col2:
+            if forecast_metrics is not None and not forecast_metrics.empty:
+                st.download_button(
+                    "Download forecast metrics CSV",
+                    forecast_metrics.to_csv(index=False).encode("utf-8"),
+                    file_name="forecast_metrics.csv",
+                    mime="text/csv",
+                )
+
+    with tab_params:
+        st.subheader("Inverted soil parameters")
+        st.caption(
+            "Online FEM inversion (fem_inversion) calibrating soil parameters from the "
+            "observed temperature field. Requires the fem_inversion service to be running."
+        )
+        fig = _inverted_parameters_plot(data.get("inversion"), invert_params)
+        if fig:
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No inverted parameters yet. Ensure the fem_inversion service is running.")
+
+        inversion_df = data.get("inversion")
+        if inversion_df is not None and not inversion_df.empty:
             st.download_button(
-                "Download measured metrics CSV",
-                thaw_metrics.to_csv(index=False).encode("utf-8"),
-                file_name="thaw_metrics.csv",
+                "Download inverted parameters CSV",
+                inversion_df.to_csv(index=False).encode("utf-8"),
+                file_name="inverted_parameters.csv",
                 mime="text/csv",
             )
-    with export_col2:
-        if forecast_metrics is not None and not forecast_metrics.empty:
-            st.download_button(
-                "Download forecast metrics CSV",
-                forecast_metrics.to_csv(index=False).encode("utf-8"),
-                file_name="forecast_metrics.csv",
-                mime="text/csv",
+
+    with tab_energy:
+        st.subheader("Energy & Efficiency Metrics")
+        st.caption(
+            "Requires fluid inlet/outlet temperatures published by the CR1000 publisher. "
+            "Configure `fluid_fields` in `startup.conf` under `cr1000_publisher`."
+        )
+        energy = _compute_energy_metrics(data.get("fluid_temperatures"), thaw_metrics)
+        if energy is None:
+            st.info(
+                "No fluid temperature data in InfluxDB yet. "
+                "Make sure `fluid_fields` is configured in `cr1000_publisher` and the CR1000 publisher is running."
             )
+        else:
+            ein_col, eta_col = st.columns(2)
+            with ein_col:
+                st.metric("Max E_in", f"{energy['Ein'].max() / 1e6:.3f} MJ")
+            with eta_col:
+                eta_latest = float(energy["eta"][np.isfinite(energy["eta"])][-1]) if np.any(np.isfinite(energy["eta"])) else None
+                st.metric("Latest η_melt", f"{eta_latest:.1f} %" if eta_latest is not None else "n/a")
+
+            row1_left, row1_right = st.columns(2)
+            with row1_left:
+                fig = _energy_ein_vs_vthaw(energy)
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("Thaw volume not available (thaw front metrics needed).")
+            with row1_right:
+                st.plotly_chart(_energy_specific(energy), use_container_width=True)
+
+            row2_left, row2_right = st.columns(2)
+            with row2_left:
+                fig = _energy_vthaw_time(energy)
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("Thaw volume not available.")
+            with row2_right:
+                st.plotly_chart(_energy_eta(energy), use_container_width=True)
+
+            if data.get("fluid_temperatures") is not None and not data["fluid_temperatures"].empty:
+                st.download_button(
+                    "Download fluid temperatures CSV",
+                    data["fluid_temperatures"].to_csv(index=False).encode("utf-8"),
+                    file_name="fluid_temperatures.csv",
+                    mime="text/csv",
+                )
 
 
 if __name__ == "__main__":
