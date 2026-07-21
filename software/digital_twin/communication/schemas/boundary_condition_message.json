@@ -16,9 +16,38 @@
           "bc_type": { "type": "string", "enum": ["dirichlet", "neumann", "robin"] },
           "temperature": { "type": ["number", "null"] },
           "heat_flux": { "type": ["number", "null"] },
-          "h_coeff": { "type": ["number", "null"] }
+          "h_coeff": { "type": ["number", "null"] },
+          "temperature_profile": {
+            "type": ["array", "null"],
+            "description": "Depth-resolved boundary temperature; overrides the scalar temperature when present.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "z_m": { "type": "number" },
+                "temperature": { "type": "number" }
+              },
+              "required": ["z_m", "temperature"],
+              "additionalProperties": false
+            }
+          }
         },
         "required": ["boundary_set", "bc_type"],
+        "additionalProperties": false
+      }
+    },
+    "sensors": {
+      "type": "array",
+      "description": "Optional sensor snapshot passed through for FEM initial-condition seeding (single timestep).",
+      "items": {
+        "type": "object",
+        "properties": {
+          "sensor_id": { "type": "string" },
+          "x_m": { "type": "number" },
+          "y_m": { "type": ["number", "null"] },
+          "z_m": { "type": "number" },
+          "temperature": { "type": "number" }
+        },
+        "required": ["sensor_id", "x_m", "z_m", "temperature"],
         "additionalProperties": false
       }
     },

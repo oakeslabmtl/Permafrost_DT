@@ -100,6 +100,9 @@ class BoundaryConditionBuilderServer:
             "timestamp": msg.get("timestamp") or datetime.utcnow().isoformat(),
             "time_hours": time_hours,
             "boundaries": boundaries,
+            # Pass the raw sensor snapshot through so the FEM solver can seed its
+            # initial condition by spatial interpolation on the first message.
+            "sensors": sensors,
         }
 
     def _process_message(self, msg: dict) -> None:

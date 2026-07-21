@@ -12,7 +12,14 @@
     "triggered": { "type": "boolean" },
     "status": { "type": "string" },
     "reason": { "type": "string" },
-    "metric": { "type": "string" }
+    "metric": { "type": "string" },
+    "r_max_m": { "type": ["number", "null"] },
+    "r_min_m": { "type": ["number", "null"] },
+    "limit_min_radius_m": { "type": ["number", "null"] },
+    "warn_fraction": { "type": ["number", "null"] },
+    "critical_fraction": { "type": ["number", "null"] },
+    "rmin_below_floor": { "type": ["boolean", "null"] },
+    "recommended_action": { "type": ["string", "null"] }
   },
   "required": [
     "time_hours",

@@ -8,6 +8,8 @@
     "time_hours": { "type": "number" },
     "radius_max_m": { "type": ["number", "null"] },
     "radius_avg_m": { "type": ["number", "null"] },
+    "radius_min_m": { "type": ["number", "null"] },
+    "thaw_volume_m3": { "type": ["number", "null"] },
     "points": {
       "type": "array",
       "items": {
@@ -20,12 +22,7 @@
         "additionalProperties": false
       }
     },
-    "contour_found": { "type": "boolean" },
-    "contour_state": { "type": "string" },
-    "contour_point_count": { "type": "integer" },
-    "proxy_radius_max_m": { "type": ["number", "null"] },
-    "proxy_radius_avg_m": { "type": ["number", "null"] },
-    "proxy_point_count": { "type": "integer" }
+    "point_count": { "type": "integer" }
   },
   "required": ["time_hours", "radius_max_m", "radius_avg_m", "points"],
   "additionalProperties": true

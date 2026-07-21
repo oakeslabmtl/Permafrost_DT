@@ -83,8 +83,21 @@ class HeaterActuationServer:
         time_hours = float(msg["time_hours"])
         triggered = bool(msg.get("triggered"))
         reason = str(msg.get("reason", "unknown"))
-        action = self.action_on_alert if triggered else self.action_on_ok
-        setpoint = self.setpoint_on_alert if triggered else self.setpoint_on_ok
+
+        # The dual-limit rule engine emits an explicit recommended_action
+        # ("stop"/"heat"); honour it directly so the decision lives in one place
+        # (the safety monitor). Legacy single-metric alerts omit it, so fall back
+        # to the triggered->alert/ok action mapping. Setpoint is still chosen from
+        # this service's config: the stop setpoint on a stop, the ok/heat setpoint
+        # otherwise.
+        recommended = msg.get("recommended_action")
+        if recommended:
+            action = str(recommended)
+            is_stop = action.lower() in ("stop", "off", "shutdown") or triggered
+            setpoint = self.setpoint_on_alert if is_stop else self.setpoint_on_ok
+        else:
+            action = self.action_on_alert if triggered else self.action_on_ok
+            setpoint = self.setpoint_on_alert if triggered else self.setpoint_on_ok
 
         return {
             "timestamp": msg.get("timestamp") or datetime.utcnow().isoformat(),
