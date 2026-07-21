@@ -1,4 +1,4 @@
-"""Replay CSV sensor data into the 2D sensor queue."""
+"""Replay CSV/XLSX sensor data into the 2D sensor queue."""
 
 from __future__ import annotations
 
@@ -8,13 +8,20 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
+
+import numpy as np
 
 from software.digital_twin.communication.messaging import RabbitMQClient, RabbitMQConfig
+from software.digital_twin.data_access.influx_utils import InfluxConfig, InfluxHelper
 
 SENSOR_QUEUE = "permafrost.record.sensors.2d"
 SENSOR_SCHEMA = Path(__file__).resolve().parents[1] / "digital_twin" / "communication" / "schemas" / "sensor_message_2d.json"
+FLUID_EXCHANGE = "permafrost.fluid"
+FLUID_SCHEMA = Path(__file__).resolve().parents[1] / "digital_twin" / "communication" / "schemas" / "fluid_message.json"
 
-SENSOR_PATTERN = re.compile(r"D(?P<depth>\d+(?:\.\d+)?)[^0-9]*W(?P<width>\d+(?:\.\d+)?)", re.IGNORECASE)
+# Matches H{height_mm}D{distance_mm}, e.g. H10D0, H290D165
+SENSOR_PATTERN = re.compile(r"H(?P<height>\d+(?:\.\d+)?)D(?P<distance>\d+(?:\.\d+)?)", re.IGNORECASE)
 
 
 def _parse_header(header: list[str], time_column: str | None) -> tuple[int, list[dict]]:
@@ -52,25 +59,61 @@ def _parse_header(header: list[str], time_column: str | None) -> tuple[int, list
         match = SENSOR_PATTERN.match(name.strip())
         if not match:
             continue
-        depth_mm = float(match.group("depth"))
-        width_mm = float(match.group("width"))
+        height_mm = float(match.group("height"))
+        distance_mm = float(match.group("distance"))
         sensors.append(
             {
                 "index": idx,
                 "sensor_id": name.strip(),
-                "x_m": width_mm / 1000.0,
-                "z_m": depth_mm / 1000.0,
+                "x_m": distance_mm / 1000.0,
+                "z_m": height_mm / 1000.0,
             }
         )
 
     if not sensors:
         preview = ", ".join(name.strip() for name in header[:10] if name)
         raise ValueError(
-            "No sensor columns found. Expected headers like D10-W15. "
+            "No sensor columns found. Expected headers like H10D0. "
             f"Header preview: {preview}"
         )
 
     return time_idx, sensors
+
+
+def _load_fluid_temps(
+    path: Path,
+    *,
+    inlet_col: str,
+    outlet_col: str,
+    time_col: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load fluid inlet/outlet temps from Excel; returns (t_h, t_inlet, t_outlet) sorted by time."""
+    import pandas as pd
+    df = pd.read_excel(path)
+    missing = [c for c in [time_col, inlet_col, outlet_col] if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Fluid temp file is missing columns: {missing}\n"
+            f"Available: {list(df.columns)}"
+        )
+    df = df[[time_col, inlet_col, outlet_col]].dropna().sort_values(time_col)
+    return (
+        df[time_col].to_numpy(dtype=float),
+        df[inlet_col].to_numpy(dtype=float),
+        df[outlet_col].to_numpy(dtype=float),
+    )
+
+
+def _iter_rows(path: Path) -> Iterator[list[str]]:
+    """Yield rows as lists of strings from a CSV or XLSX file."""
+    if path.suffix.lower() in {".xlsx", ".xls"}:
+        import pandas as pd
+        df = pd.read_excel(path, dtype=str, header=None, keep_default_na=False)
+        for row in df.itertuples(index=False, name=None):
+            yield list(row)
+    else:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            yield from csv.reader(handle)
 
 
 def replay_csv(
@@ -87,9 +130,19 @@ def replay_csv(
     start_row: int,
     limit: int | None,
     sleep_seconds: float,
+    fluid_path: Path | None = None,
+    fluid_inlet_col: str = "Fluid Temperature_Inlet",
+    fluid_outlet_col: str = "Fluid Temperatue_Outlet",
+    fluid_time_col: str = "Time (h)",
+    fluid_exchange: str = FLUID_EXCHANGE,
+    influx_url: str = "http://localhost:8086",
+    influx_token: str = "permafrost",
+    influx_org: str = "permafrost",
+    influx_bucket: str = "permafrost_data",
+    site_id: str = "default",
 ) -> None:
     if not path.exists():
-        raise FileNotFoundError(f"CSV file not found at {path}")
+        raise FileNotFoundError(f"File not found at {path}")
 
     config = RabbitMQConfig(
         host=host,
@@ -102,13 +155,47 @@ def replay_csv(
         password=password,
     )
 
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.reader(handle)
-        header = next(reader, [])
-        time_idx, sensors = _parse_header(header, time_column)
+    fluid_temps: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+    influx: InfluxHelper | None = None
+    fluid_client: RabbitMQClient | None = None
+    if fluid_path is not None:
+        if not fluid_path.exists():
+            raise FileNotFoundError(f"Fluid temp file not found at {fluid_path}")
+        fluid_temps = _load_fluid_temps(
+            fluid_path,
+            inlet_col=fluid_inlet_col,
+            outlet_col=fluid_outlet_col,
+            time_col=fluid_time_col,
+        )
+        # Publish to the fluid fanout the pipe_boundary service consumes.
+        fluid_client = RabbitMQClient(
+            RabbitMQConfig(
+                host=host,
+                queue="",
+                exchange=fluid_exchange,
+                exchange_type="fanout",
+                schema_path=FLUID_SCHEMA,
+                username=username,
+                password=password,
+            )
+        )
+        fluid_client.connect()
+        # Also mirror to Influx (best-effort; no-op if Influx is unreachable).
+        influx = InfluxHelper(
+            InfluxConfig(url=influx_url, token=influx_token, org=influx_org, bucket=influx_bucket)
+        )
+        print(
+            f"Fluid temps loaded: {len(fluid_temps[0])} rows from {fluid_path.name} "
+            f"-> publishing to '{fluid_exchange}' fanout"
+        )
 
+    row_iter = _iter_rows(path)
+    header = next(row_iter, [])
+    time_idx, sensors = _parse_header(header, time_column)
+
+    try:
         with RabbitMQClient(config) as client:
-            for row_index, row in enumerate(reader, start=1):
+            for row_index, row in enumerate(row_iter, start=1):
                 if row_index < start_row:
                     continue
                 if limit is not None and (row_index - start_row) >= limit:
@@ -157,13 +244,40 @@ def replay_csv(
                 }
                 client.publish(message)
 
+                if fluid_temps is not None:
+                    t_arr, tin_arr, tout_arr = fluid_temps
+                    t_in = float(np.interp(time_hours, t_arr, tin_arr))
+                    t_out = float(np.interp(time_hours, t_arr, tout_arr))
+                    if fluid_client is not None:
+                        fluid_client.publish(
+                            {
+                                "time_hours": time_hours,
+                                "timestamp": message["timestamp"],
+                                "t_inlet_c": t_in,
+                                "t_outlet_c": t_out,
+                                "site_id": site_id,
+                            }
+                        )
+                    if influx is not None:
+                        influx.write_fluid_temperatures(
+                            time_hours=time_hours,
+                            t_inlet_c=t_in,
+                            t_outlet_c=t_out,
+                            site=site_id,
+                        )
+
                 if sleep_seconds > 0:
                     time.sleep(sleep_seconds)
+    finally:
+        if fluid_client is not None:
+            fluid_client.disconnect()
+        if influx is not None:
+            influx.close()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Replay CSV sensor data to RabbitMQ.")
-    parser.add_argument("--path", required=True, help="Path to the CSV file.")
+    parser.add_argument("--path", required=True, help="Path to the CSV or XLSX file.")
     parser.add_argument("--queue", default=None, help="RabbitMQ queue name.")
     parser.add_argument(
         "--exchange",
@@ -179,6 +293,20 @@ def main() -> None:
     parser.add_argument("--start-row", type=int, default=1, help="First data row to replay (1-based).")
     parser.add_argument("--limit", type=int, default=None, help="Maximum number of rows to publish.")
     parser.add_argument("--sleep-seconds", type=float, default=0.0, help="Sleep between rows.")
+
+    fluid_group = parser.add_argument_group("fluid temperatures")
+    fluid_group.add_argument("--fluid-path", default=None, help="Path to the fluid inlet/outlet temperature XLSX file.")
+    fluid_group.add_argument("--fluid-inlet-col", default="Fluid Temperature_Inlet", help="Inlet temperature column name.")
+    fluid_group.add_argument("--fluid-outlet-col", default="Fluid Temperatue_Outlet", help="Outlet temperature column name.")
+    fluid_group.add_argument("--fluid-time-col", default="Time (h)", help="Time column name in the fluid file.")
+    fluid_group.add_argument("--fluid-exchange", default=FLUID_EXCHANGE, help="Fanout exchange for fluid messages (consumed by pipe_boundary).")
+    fluid_group.add_argument("--site-id", default="default", help="Site ID tag written to InfluxDB.")
+
+    influx_group = parser.add_argument_group("influxdb (required when --fluid-path is set)")
+    influx_group.add_argument("--influx-url", default="http://localhost:8086", help="InfluxDB URL.")
+    influx_group.add_argument("--influx-token", default="permafrost", help="InfluxDB token.")
+    influx_group.add_argument("--influx-org", default="permafrost", help="InfluxDB org.")
+    influx_group.add_argument("--influx-bucket", default="permafrost_data", help="InfluxDB bucket.")
 
     args = parser.parse_args()
     if args.queue is None:
@@ -199,6 +327,16 @@ def main() -> None:
         start_row=args.start_row,
         limit=args.limit,
         sleep_seconds=args.sleep_seconds,
+        fluid_path=Path(args.fluid_path) if args.fluid_path else None,
+        fluid_inlet_col=args.fluid_inlet_col,
+        fluid_outlet_col=args.fluid_outlet_col,
+        fluid_time_col=args.fluid_time_col,
+        fluid_exchange=args.fluid_exchange,
+        influx_url=args.influx_url,
+        influx_token=args.influx_token,
+        influx_org=args.influx_org,
+        influx_bucket=args.influx_bucket,
+        site_id=args.site_id,
     )
 
 
