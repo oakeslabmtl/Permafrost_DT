@@ -9,6 +9,7 @@ from typing import Mapping
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
+from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 
 from software.digital_twin.simulator.fem_forecast.lagrange_basis import lagrange_basis
 from software.digital_twin.simulator.fem_forecast.quadrature import quadrature
@@ -48,11 +49,11 @@ class MaterialProps:
 @dataclass(frozen=True)
 class SolverConfig:
     """Solver configuration"""
-    dt_seconds: float = 36.0
+    dt_seconds: float = 30.0
     max_iterations: int = 1
     tol_r: float = 1e-6
     temperature_offset_k: float = 0.0
-    initial_temperature_c: float = -1.0
+    initial_temperature_c: float = -7.0 #TODO read initial temp from csv, and interpolate for more accuracy
     thaw_threshold_c: float = 0.0
 
 
@@ -106,11 +107,94 @@ class FEMSolver2D:
         self.W1, self.Q1 = quadrature(2, "GAUSS", 1)
         self.W2, self.Q2 = quadrature(2, "GAUSS", 2)
 
-        # Initialize temperature field
+        # Initialize temperature field with a uniform fallback. This is replaced
+        # by a spatially-interpolated field on the first sensor snapshot via
+        # seed_initial_field(); _seeded guards against re-seeding once the
+        # solution has started marching forward.
         initial_temp_k = self._to_kelvin(self.solver.initial_temperature_c)
         self.T = np.full(self.numnode, initial_temp_k, dtype=float)
+        self._seeded = False
         self.time_hours = None
         self._build_geometry_cache()
+
+    # ---------------------------
+    # INITIAL CONDITION SEEDING
+    # ---------------------------
+    def seed_initial_field(self, sensors: list[dict]) -> bool:
+        """Seed the initial temperature field from a single sensor snapshot.
+
+        Replaces the uniform initial condition with a per-node field built by
+        spatially interpolating one snapshot of thermocouple readings onto the
+        mesh nodes. This is a purely spatial operation: it needs all sensors at
+        one instant, not a time history, so it works directly off the first
+        streamed snapshot.
+
+        Linear (Delaunay) interpolation is used inside the convex hull of the
+        sensor positions; nodes outside that hull (e.g. unmonitored corners)
+        fall back to nearest-sensor extrapolation. This mirrors the reference
+        interpolation_initial.py.
+
+        Sensor x_m/z_m are expected in the same metric frame as the mesh nodes.
+        Runs at most once (guarded by ``_seeded``); later calls are no-ops so the
+        forward-marching solution is never reset.
+
+        Returns:
+            True if the field was seeded, False if it kept the uniform fallback
+            (already seeded, or too few usable sensors to triangulate).
+        """
+        if self._seeded:
+            return False
+
+        points: list[tuple[float, float]] = []
+        temps_c: list[float] = []
+        for sensor in sensors:
+            try:
+                x_m = float(sensor["x_m"])
+                z_m = float(sensor["z_m"])
+                temp_c = float(sensor["temperature"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            points.append((x_m, z_m))
+            temps_c.append(temp_c)
+
+        # LinearNDInterpolator needs a non-degenerate triangulation (>=3
+        # non-collinear points). Below that, keep the uniform IC.
+        if len(points) < 3:
+            self.logger.warning(
+                "seed_initial_field: only %d usable sensor(s) (<3); keeping uniform IC.",
+                len(points),
+            )
+            return False
+
+        sensor_points = np.asarray(points, dtype=float)
+        sensor_temps_c = np.asarray(temps_c, dtype=float)
+
+        try:
+            linear = LinearNDInterpolator(sensor_points, sensor_temps_c)
+            nearest = NearestNDInterpolator(sensor_points, sensor_temps_c)
+        except Exception as exc:  # e.g. QhullError for collinear sensors
+            self.logger.warning(
+                "seed_initial_field: interpolation setup failed (%s); keeping uniform IC.",
+                exc,
+            )
+            return False
+
+        node_temps_c = linear(self.node)
+        nan_mask = np.isnan(node_temps_c)
+        if np.any(nan_mask):
+            node_temps_c[nan_mask] = nearest(self.node[nan_mask])
+
+        self.T = node_temps_c.astype(float) + float(self.solver.temperature_offset_k)
+        self._seeded = True
+        self.logger.info(
+            "Seeded initial field from %d sensors (T range %.2f..%.2f C, %d/%d nodes extrapolated).",
+            len(points),
+            float(np.min(node_temps_c)),
+            float(np.max(node_temps_c)),
+            int(np.sum(nan_mask)),
+            self.numnode,
+        )
+        return True
 
     # ---------------------------
     # GEOMETRY CACHING
@@ -147,7 +231,7 @@ class FEMSolver2D:
         self.elem_dNdx = np.zeros((self.numelem, nqp, nn, 2), dtype=float)
         self.elem_detJ = np.zeros((self.numelem, nqp), dtype=float)
 
-        #also compute J on gpu since our mesh is large it could be causing overhead?q
+        #TODO also compute J on gpu since our mesh is large it could be causing overhead?q
         for iel in range(self.numelem):
             sctrT = self.elem_sctr[iel]
             Xe = self.node[sctrT, :]
@@ -185,6 +269,39 @@ class FEMSolver2D:
     def _to_kelvin(self, temp_c: float) -> float:
         return float(temp_c) + float(self.solver.temperature_offset_k)
 
+    def _bc_nodal_temperature_k(self, bc: dict, node_ids: np.ndarray) -> np.ndarray | None:
+        """Nodal boundary temperature (Kelvin) for the given node ids.
+
+        Supports a depth-resolved ``temperature_profile`` (list of
+        ``{z_m, temperature}``) interpolated by node depth ``z``; values outside
+        the profile range are clamped to its ends. Falls back to the scalar
+        ``temperature``. Returns None if neither is present.
+        """
+        node_ids = np.asarray(node_ids, dtype=int)
+        profile = bc.get("temperature_profile")
+        if isinstance(profile, list) and profile:
+            zs: list[float] = []
+            ts: list[float] = []
+            for point in profile:
+                try:
+                    zs.append(float(point["z_m"]))
+                    ts.append(float(point["temperature"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            if len(zs) >= 2:
+                order = np.argsort(zs)
+                zs_arr = np.asarray(zs)[order]
+                ts_arr = np.asarray(ts)[order]
+                z_nodes = self.node[node_ids, 1]
+                temps_c = np.interp(z_nodes, zs_arr, ts_arr)  # clamps at ends
+                return temps_c + float(self.solver.temperature_offset_k)
+            if len(zs) == 1:
+                return np.full(node_ids.shape[0], self._to_kelvin(ts[0]))
+        temperature = bc.get("temperature")
+        if temperature is None:
+            return None
+        return np.full(node_ids.shape[0], self._to_kelvin(float(temperature)))
+
     def _thaw_threshold_k(self) -> float:
         return self._to_kelvin(self.solver.thaw_threshold_c)
 
@@ -207,7 +324,7 @@ class FEMSolver2D:
     # Core FEM assembly loop corresponding to baseline TIME-STEPPING LOOP
     # ---------------------------
 
-    # use cupy for gpu bases matmul, move away from nested loops
+    #TODO  use cupy for gpu bases matmul, move away from nested loops
     def _assemble_system(self, boundary_snapshot: dict) -> tuple[sp.csr_matrix, np.ndarray, dict[int, float]]:
         """Assemble global stiffness matrix K and force vector f.
 
@@ -245,13 +362,12 @@ class FEMSolver2D:
                 continue
 
             if bc_type == "dirichlet":
-                temperature = bc.get("temperature")
-                if temperature is None:
-                    continue
-                temp_k = self._to_kelvin(float(temperature))
                 nodes = self._boundary_nodes(boundary_set)
-                for node_id in nodes:
-                    dirichlet_map[int(node_id)] = temp_k
+                temps_k = self._bc_nodal_temperature_k(bc, nodes)
+                if temps_k is None:
+                    continue
+                for node_id, temp_k in zip(nodes, temps_k):
+                    dirichlet_map[int(node_id)] = float(temp_k)
                 continue
 
             if bc_type not in {"neumann", "robin"}:
@@ -264,24 +380,35 @@ class FEMSolver2D:
                 coords = self.node[edges, :]
                 edge_lengths = np.linalg.norm(coords[:, 1, :] - coords[:, 0, :], axis=1)
                 J0s = edge_lengths / 2.0
+            # For Robin, precompute h and the per-node ambient temperature (K),
+            # which may vary with depth via a temperature_profile.
+            robin_h: float | None = None
+            robin_amb_k: np.ndarray | None = None
+            if bc_type == "robin":
+                h_coeff = bc.get("h_coeff")
+                if h_coeff is None:
+                    continue
+                robin_h = float(h_coeff)
+                robin_amb_k = self._bc_nodal_temperature_k(bc, np.arange(self.numnode))
+                if robin_amb_k is None:
+                    continue
+
             for idx, sctr in enumerate(edges):
                 nn = len(sctr)
                 J0 = float(J0s[idx])
+                amb_nodes = robin_amb_k[sctr] if robin_amb_k is not None else None
                 for N, w in self.edge_basis:
                     if bc_type == "robin":
-                        temperature = bc.get("temperature")
-                        h_coeff = bc.get("h_coeff")
-                        if temperature is None or h_coeff is None:
-                            continue
-                        temp_k = self._to_kelvin(float(temperature))
-                        h_coeff = float(h_coeff)
+                        # Ambient temperature at the quadrature point from the
+                        # (possibly depth-varying) nodal ambient values.
+                        temp_k = float(N @ amb_nodes)
                         # Implicit: force term only carries the known T_env part;
                         # T_new part goes into the stiffness matrix K_robin.
-                        fT_local = N * h_coeff * temp_k * J0 * w
+                        fT_local = N * robin_h * temp_k * J0 * w
                         for a in range(nn):
                             fT[sctr[a]] += fT_local[a]
                         # K_robin contribution: h * N_a * N_b * J0 * w
-                        K_robin_local = h_coeff * np.outer(N, N) * J0 * w
+                        K_robin_local = robin_h * np.outer(N, N) * J0 * w
                         for a in range(nn):
                             for b_idx in range(nn):
                                 rows_r.append(sctr[a])
@@ -375,14 +502,27 @@ class FEMSolver2D:
     # ---------------------------
     @staticmethod
     def _apply_dirichlet(A_mat: sp.csr_matrix, b_vec: np.ndarray, dofs: dict[int, float]) -> tuple[sp.csr_matrix, np.ndarray]:
-        """Apply essential (Dirichlet) boundary conditions by row/column elimination."""
+        """Apply essential (Dirichlet) boundary conditions by row replacement.
+
+        For each constrained DOF the matrix row is zeroed, a scaled identity is
+        placed on the diagonal, and the RHS is set so the solve returns the
+        prescribed value: ``A[d,d]*T[d] = scale*value`` -> ``T[d] = value``.
+
+        Only the *row* is replaced; the column is deliberately left intact. The
+        constrained value enters each neighbour's equation through the surviving
+        ``A[n,d]*T[d]`` coupling, which is correct because ``T[d]`` is pinned.
+        Zeroing the column as well (without moving ``A[:,d]*value`` to the RHS)
+        drops that coupling from every neighbour and makes the transient solve
+        diverge — a -5 C boundary was driving the field to <-150 C over a few
+        steps. The matrix is no longer symmetric, but the direct sparse solver
+        handles that fine.
+        """
         if not dofs:
             return A_mat, b_vec
         diag_scale = float(np.mean(A_mat.diagonal())) if A_mat.nnz else 1.0
         A_lil = A_mat.tolil()
         for dof, value in dofs.items():
             A_lil[dof, :] = 0.0
-            A_lil[:, dof] = 0.0
             A_lil[dof, dof] = diag_scale
             b_vec[dof] = diag_scale * float(value)
         return A_lil.tocsr(), b_vec
@@ -438,17 +578,29 @@ class FEMSolver2D:
     # Extract thaw-front metrics from temperature solution
     # ---------------------------
     def compute_thaw_metrics(self) -> tuple[float | None, float | None, list[dict[str, float]]]:
-        """Extract thaw-front radius from temperature field.
-        
-        Finds all nodes that exceed thaw_threshold_c and computes
-        max and mean radial distance from domain center.
+        """Extract thaw-front metrics from temperature field.
+
+        For each depth level z in the mesh, finds the outermost thawed node
+        (max |x| with T >= threshold) to form the per-depth front envelope.
+        r_max and r_avg are computed from these front points only — not from
+        the entire thawed interior — making them consistent with the contour
+        method in thaw_front_reconstruction_server which averages over isotherm
+        points rather than all thawed nodes.
         """
         threshold_k = self._thaw_threshold_k()
         thaw_mask = self.T >= threshold_k
         if not np.any(thaw_mask):
             return None, None, []
 
-        thaw_nodes = self.node[thaw_mask, :2]
-        points = [{"x_m": float(x), "z_m": float(z)} for x, z in thaw_nodes]
-        radii = np.abs(thaw_nodes[:, 0])
-        return float(np.max(radii)), float(np.mean(radii)), points
+        r_abs = np.abs(self.node[:, 0])
+        z_coords = self.node[:, 1]
+
+        # One representative front point per depth level: outermost thawed node
+        front_points: list[dict[str, float]] = []
+        for z in np.unique(z_coords[thaw_mask]):
+            depth_mask = thaw_mask & (z_coords == z)
+            front_r = float(np.max(r_abs[depth_mask]))
+            front_points.append({"x_m": front_r, "z_m": float(z)})
+
+        front_radii = np.array([p["x_m"] for p in front_points])
+        return float(np.max(front_radii)), float(np.mean(front_radii)), front_points

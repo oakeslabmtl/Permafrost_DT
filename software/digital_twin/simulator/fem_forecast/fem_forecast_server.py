@@ -57,6 +57,8 @@ class FEMForecastServer:
         input_queue: str | None = None,
         output_queue: str | None = None,
         horizon_hours: float = 1.0,
+        track_observed_time: bool = True,
+        max_step_hours: float = 0.5,
         site_id: str = "default",
         mesh_dir: str | Path | None = None,
         node_file: str = "DT_model_nodes.txt",
@@ -83,6 +85,9 @@ class FEMForecastServer:
             schema_path=FORECAST_SCHEMA,
         )
         self.horizon_hours = float(horizon_hours)
+        self.track_observed_time = self._as_bool(track_observed_time, True)
+        self.max_step_hours = float(max_step_hours)
+        self._last_time_hours: float | None = None
         self.site_id = site_id
         self.mesh_dir = Path(mesh_dir) if mesh_dir is not None else None
         self.node_file = node_file
@@ -101,6 +106,10 @@ class FEMForecastServer:
         self.influx: Optional[InfluxHelper] = None
         self._solver: Optional[FEMSolver2D] = None
         self._last_material_override: dict[str, float] | None = None
+        # Observed sensor layout (from the boundary message passthrough), used to
+        # sample the FEM field at the same positions as the observations so the
+        # forecast plot's markers/contour match the observation plot.
+        self._sensor_positions: list[dict[str, float | str]] | None = None
 
     @staticmethod
     def _as_bool(value: object, default: bool) -> bool:
@@ -255,7 +264,15 @@ class FEMForecastServer:
         return sampled
 
     def _sample_field_at_sensor_grid(self, field: FieldSnapshot) -> list[dict[str, float | str]]:
-        """Sample FEM field at the configured D*-W* grid using nearest FEM node."""
+        """Sample the FEM field at the observed sensor positions when known.
+
+        Using the actual sensor layout (from the boundary message passthrough)
+        makes the forecast markers/contour align exactly with the observation
+        plot — including the x=0 axis column, which the built-in D*-W* grid
+        omits. Falls back to the built-in grid before any sensors are seen.
+        """
+        if self._sensor_positions:
+            return self._sample_field_at_positions(field, self._sensor_positions)
         grid_positions = [
             {
                 "sensor_id": f"D{depth_mm}-W{width_mm}",
@@ -266,6 +283,25 @@ class FEMForecastServer:
             for width_mm in self.SENSOR_WIDTHS_MM
         ]
         return self._sample_field_at_positions(field, grid_positions)
+
+    def _update_sensor_positions(self, sensors: object) -> None:
+        """Cache the observed sensor layout from a boundary message passthrough."""
+        if not isinstance(sensors, list) or not sensors:
+            return
+        positions: list[dict[str, float | str]] = []
+        for sensor in sensors:
+            try:
+                positions.append(
+                    {
+                        "sensor_id": str(sensor["sensor_id"]),
+                        "x_m": float(sensor["x_m"]),
+                        "z_m": float(sensor["z_m"]),
+                    }
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        if positions:
+            self._sensor_positions = positions
 
     def _build_solver(self) -> FEMSolver2D:
         if self.mesh_dir is None:
@@ -302,10 +338,48 @@ class FEMForecastServer:
         )
         return FEMSolver2D(mesh=mesh, material=material, solver=solver)
 
-    def _run_forecast(self, boundary_snapshot: dict) -> ForecastResult:
+    def _maybe_seed_initial_field(self, sensors: object) -> None:
+        """Seed the FEM initial condition from the first sensor snapshot.
+
+        Builds the solver if needed and asks it to interpolate the snapshot onto
+        the mesh nodes. The solver guards against re-seeding, so this is safe to
+        call on every message — only the first usable snapshot takes effect.
+        """
+        if not sensors or not isinstance(sensors, list):
+            return
         if self._solver is None:
             self._solver = self._build_solver()
-        self._solver.advance(boundary_snapshot, horizon_hours=self.horizon_hours)
+        if self._solver.seed_initial_field(sensors):
+            self.logger.info(
+                "FEM initial condition seeded from sensor snapshot (%d sensors).",
+                len(sensors),
+            )
+
+    def _resolve_step_hours(self, time_hours: float) -> float:
+        """Time to advance for this message.
+
+        When ``track_observed_time`` is set, advance by the real elapsed time
+        since the previous message so simulated time tracks observed time and
+        the thaw-front spread rate matches reality. A fixed horizon per message
+        (the previous behaviour) integrates far more heating than the elapsed
+        time when messages arrive faster than the horizon, over-spreading the
+        field. The first message (or non-tracking mode) uses ``horizon_hours``.
+        """
+        if not self.track_observed_time or self._last_time_hours is None:
+            return float(self.horizon_hours)
+        step = float(time_hours) - float(self._last_time_hours)
+        if step <= 0.0:
+            return 0.0  # duplicate / out-of-order message: don't integrate
+        if self.max_step_hours > 0.0:
+            step = min(step, self.max_step_hours)
+        return step
+
+    def _run_forecast(self, boundary_snapshot: dict, step_hours: float | None = None) -> ForecastResult:
+        if self._solver is None:
+            self._solver = self._build_solver()
+        hz = self.horizon_hours if step_hours is None else step_hours
+        if hz > 0.0:
+            self._solver.advance(boundary_snapshot, horizon_hours=hz)
         radius_max_m, radius_avg_m, points = self._solver.compute_thaw_metrics()
         return ForecastResult(
             radius_max_m=radius_max_m,
@@ -320,9 +394,10 @@ class FEMForecastServer:
         include_field: bool = True,
         save_field_csv: bool = True,
         field_csv_dir: str | None = None,
+        step_hours: float | None = None,
     ) -> tuple[ForecastResult, FieldSnapshot | None, str | None]:
         """Run forecast with optional field snapshot and CSV output.
-        
+
         Returns:
             (ForecastResult, FieldSnapshot or None, csv_path or None)
         """
@@ -333,9 +408,11 @@ class FEMForecastServer:
         if material_override is not None:
             merged.update(self._normalize_material_override(material_override))
         self._solver.material = self._material_from_dict(merged)
-        
+
         # Run forecast
-        self._solver.advance(boundary_snapshot, horizon_hours=self.horizon_hours)
+        hz = self.horizon_hours if step_hours is None else step_hours
+        if hz > 0.0:
+            self._solver.advance(boundary_snapshot, horizon_hours=hz)
         radius_max_m, radius_avg_m, points = self._solver.compute_thaw_metrics()
         result = ForecastResult(
             radius_max_m=radius_max_m,
@@ -413,7 +490,14 @@ class FEMForecastServer:
             time_hours = float(msg["time_hours"])
             boundary_count = len(msg.get("boundaries", []))
             field_snapshot: FieldSnapshot | None = None
-            
+
+            # Seed the initial condition from the first sensor snapshot before
+            # the solver marches forward. No-op once already seeded.
+            self._maybe_seed_initial_field(msg.get("sensors"))
+            # Track the observed sensor layout so the forecast is sampled at the
+            # same positions as the observations (matching plot markers/contour).
+            self._update_sensor_positions(msg.get("sensors"))
+
             # Extract optional field/material control flags
             include_field = self._as_bool(msg.get("include_field"), self.include_field_default)
             save_field_csv = self._as_bool(msg.get("save_field_csv"), self.save_field_csv_default)
@@ -434,6 +518,9 @@ class FEMForecastServer:
                 material_override = dict(self._last_material_override)
                 override_source = "sticky"
             
+            # Advance by real elapsed time (tracking) instead of a fixed horizon.
+            step_hours = self._resolve_step_hours(time_hours)
+
             # Choose forecast path based on flags
             if include_field or save_field_csv or material_override is not None:
                 result, field_snapshot, csv_path = self._run_forecast_with_field(
@@ -442,11 +529,18 @@ class FEMForecastServer:
                     include_field=include_field,
                     save_field_csv=save_field_csv,
                     field_csv_dir=field_csv_dir,
+                    step_hours=step_hours,
                 )
                 if csv_path:
                     self.logger.info("Field CSV written to %s", csv_path)
             else:
-                result = self._run_forecast(msg)
+                result = self._run_forecast(msg, step_hours=step_hours)
+
+            # In tracking mode the field now represents the observation time, so
+            # report that (advance() would otherwise tag it observed_time+step).
+            if self.track_observed_time and self._solver is not None:
+                self._solver.time_hours = time_hours
+            self._last_time_hours = time_hours
             
             override_keys = sorted(material_override.keys()) if material_override else []
             self.logger.info(
