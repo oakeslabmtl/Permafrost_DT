@@ -245,7 +245,7 @@ def run_menu(ser: serial.Serial) -> None:
                 log("ERROR", f"Invalid input '{raw}' — could not convert to a number")
                 continue
 
-            if not (0 <= value <= 200):
+            if not (-30 <= value <= 50):
                 log("ERROR", f"Setpoint {value:.2f} C is out of allowed range (0-200 C)")
                 continue
 
