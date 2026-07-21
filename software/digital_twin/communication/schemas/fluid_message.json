@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "FluidTemperatureMessage",
+  "description": "Heat-exchanger loop inlet/outlet fluid temperatures from the CR1000.",
+  "type": "object",
+  "properties": {
+    "timestamp": { "type": "string", "format": "date-time" },
+    "time_hours": { "type": "number" },
+    "t_inlet_c": { "type": "number" },
+    "t_outlet_c": { "type": "number" },
+    "site_id": { "type": "string" }
+  },
+  "required": ["time_hours", "t_inlet_c", "t_outlet_c"],
+  "additionalProperties": false
+}
