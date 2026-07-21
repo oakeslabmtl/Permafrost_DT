@@ -94,7 +94,10 @@ def configure_logging(
     config_dict = _build_config(json_enabled)
     logging.config.dictConfig(config_dict)
 
-    for noisy_logger in ("pika", "urllib3", "asyncio", "influxdb_client"):
+    for noisy_logger in (
+        "pika", "urllib3", "asyncio", "influxdb_client",
+        "pylink", "pycampbellcr1000",  # log every serial byte / PakBus packet at INFO
+    ):
         logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
     _CONFIGURED = True

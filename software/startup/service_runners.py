@@ -13,8 +13,11 @@ import software.digital_twin.monitoring.boundary_condition_builder.boundary_cond
 import software.digital_twin.monitoring.thaw_front_reconstruction.thaw_front_reconstruction_server as thaw_module
 import software.digital_twin.simulator.fem_forecast.fem_forecast_server as fem_module
 import software.digital_twin.simulator.fem_inversion.fem_inversion_server as inversion_module
+import software.digital_twin.simulator.pipe_boundary.pipe_boundary_server as pipe_module
 import software.digital_twin.control.safety_monitor.safety_monitor_server as safety_module
 import software.digital_twin.control.heater_actuation.heater_actuation_server as heater_module
+import software.digital_twin.control.polyscience_control.polyscience_control_server as polyscience_module
+import software.digital_twin.monitoring.observation_ingestion.cr1000_publisher_server as cr1000_module
 from software.startup import start_viz_dashboard as viz_dashboard_module
 
 
@@ -135,7 +138,8 @@ def create_thaw_front_reconstruction_server(
         thaw_threshold_c=float(thaw_cfg.get("thaw_threshold_c", 0.0)),
         contour_grid_r=int(thaw_cfg.get("contour_grid_r", 120)),
         contour_grid_z=int(thaw_cfg.get("contour_grid_z", 150)),
-        primary_metric_source=str(thaw_cfg.get("primary_metric_source", "contour")),
+        rmin_depth_bins=int(thaw_cfg.get("rmin_depth_bins", 8)),
+        surface_exclusion_m=float(thaw_cfg.get("surface_exclusion_m", 0.03)),
         site_id=str(thaw_cfg.get("site_id", "default")),
     )
 
@@ -167,6 +171,8 @@ def create_fem_forecast_server(
         input_queue=input_queue,
         output_queue=output_queue,
         horizon_hours=float(fem_cfg.get("horizon_hours", 1.0)),
+        track_observed_time=bool(fem_cfg.get("track_observed_time", True)),
+        max_step_hours=float(fem_cfg.get("max_step_hours", 0.5)),
         site_id=str(fem_cfg.get("site_id", "default")),
         mesh_dir=mesh_dir,
         node_file=str(fem_cfg.get("node_file", "DT_model_nodes.txt")),
@@ -268,6 +274,68 @@ def create_fem_inversion_server(
     )
 
 
+def create_pipe_boundary_server(
+    influx_config: InfluxConfig,
+    rabbit_cfg: Dict[str, str],
+    pipe_cfg: Dict[str, object],
+):
+    boundary_in_queue = str(pipe_cfg.get("input_queue", pipe_module.BOUNDARY_IN_QUEUE))
+    boundary_out_queue = str(pipe_cfg.get("output_queue", pipe_module.BOUNDARY_OUT_QUEUE))
+    fluid_queue = str(pipe_cfg.get("fluid_queue", pipe_module.FLUID_QUEUE))
+    fluid_exchange = str(pipe_cfg.get("fluid_exchange", pipe_module.FLUID_EXCHANGE))
+    fluid_exchange_type = str(pipe_cfg.get("fluid_exchange_type", "fanout"))
+    calibration_queue = str(pipe_cfg.get("calibration_queue", pipe_module.CALIBRATION_QUEUE))
+
+    initial_params = pipe_cfg.get("initial_params")
+    lower_bounds = pipe_cfg.get("lower_bounds")
+    upper_bounds = pipe_cfg.get("upper_bounds")
+    fixed_params = pipe_cfg.get("fixed_params")
+
+    return pipe_module.PipeBoundaryServer(
+        influx_config=influx_config,
+        boundary_in_config=_rabbit_config(rabbit_cfg, pipe_module.BOUNDARY_SCHEMA, queue=boundary_in_queue),
+        boundary_out_config=_rabbit_config(rabbit_cfg, pipe_module.BOUNDARY_SCHEMA, queue=boundary_out_queue),
+        fluid_config=_rabbit_config(
+            rabbit_cfg,
+            pipe_module.FLUID_SCHEMA,
+            queue=fluid_queue,
+            exchange=fluid_exchange,
+            exchange_type=fluid_exchange_type,
+        ),
+        calibration_config=_rabbit_config(rabbit_cfg, pipe_module.CALIBRATION_SCHEMA, queue=calibration_queue),
+        boundary_in_queue=boundary_in_queue,
+        boundary_out_queue=boundary_out_queue,
+        fluid_queue=fluid_queue,
+        calibration_queue=calibration_queue,
+        site_id=str(pipe_cfg.get("site_id", "default")),
+        h_sample_m=float(pipe_cfg.get("h_sample_m", 0.30)),
+        r_bend_m=float(pipe_cfg.get("r_bend_m", 0.0)),
+        n_cells=int(pipe_cfg.get("n_cells", 120)),
+        max_dt_s=float(pipe_cfg.get("max_dt_s", 5.0)),
+        max_steps=int(pipe_cfg.get("max_steps", 3000)),
+        pipe_boundary_set=str(pipe_cfg.get("pipe_boundary_set", "left")),
+        pipe_bc_type=str(pipe_cfg.get("pipe_bc_type", "robin")),
+        pipe_h_coeff=float(pipe_cfg.get("pipe_h_coeff", 5.0)),
+        interface_source=str(pipe_cfg.get("interface_source", "fluid")),
+        interface_reduction=str(pipe_cfg.get("interface_reduction", "mean")),
+        depth_resolved=bool(pipe_cfg.get("depth_resolved", True)),
+        profile_points=int(pipe_cfg.get("profile_points", 17)),
+        window_seconds=float(pipe_cfg.get("window_seconds", 7200.0)),
+        min_points=int(pipe_cfg.get("min_points", 5)),
+        max_points=int(pipe_cfg.get("max_points", 240)),
+        recalibrate_seconds=float(pipe_cfg.get("recalibrate_seconds", 300.0)),
+        maxiter=int(pipe_cfg.get("maxiter", 40)),
+        maxfun=int(pipe_cfg.get("maxfun", 80)),
+        initial_params=initial_params if isinstance(initial_params, dict) else None,
+        lower_bounds=lower_bounds if isinstance(lower_bounds, dict) else None,
+        upper_bounds=upper_bounds if isinstance(upper_bounds, dict) else None,
+        fixed_params=fixed_params if isinstance(fixed_params, dict) else None,
+        warm_start=bool(pipe_cfg.get("warm_start", True)),
+        passthrough_until_ready=bool(pipe_cfg.get("passthrough_until_ready", True)),
+        publish_calibration=bool(pipe_cfg.get("publish_calibration", True)),
+    )
+
+
 def create_safety_monitor_server(
     influx_config: InfluxConfig,
     rabbit_cfg: Dict[str, str],
@@ -319,8 +387,103 @@ def create_safety_monitor_server(
         output_queue=output_queue,
         limit_radius_m=float(safety_cfg.get("limit_radius_m", 0.1)),
         metric=str(safety_cfg.get("metric", "max")),
+        mode=str(safety_cfg.get("mode", "single")),
+        limit_min_radius_m=float(safety_cfg.get("limit_min_radius_m", 0.0)),
+        warn_fraction=float(safety_cfg.get("warn_fraction", 0.6)),
+        critical_fraction=float(safety_cfg.get("critical_fraction", 0.9)),
         publish_on_change=bool(safety_cfg.get("publish_on_change", False)),
         site_id=str(safety_cfg.get("site_id", "default")),
+    )
+
+
+def create_cr1000_publisher_server(
+    rabbit_cfg: Dict[str, str],
+    cr1000_cfg: Dict[str, object],
+    influx_cfg: Optional[Dict[str, str] | InfluxConfig] = None,
+):
+    exchange = str(cr1000_cfg.get("exchange", cr1000_module.SENSOR_EXCHANGE))
+    exchange_type = str(cr1000_cfg.get("exchange_type", "fanout"))
+    mq_config = RabbitMQConfig(
+        host=rabbit_cfg.get("host", "localhost"),
+        queue="",
+        exchange=exchange,
+        exchange_type=exchange_type,
+        schema_path=cr1000_module.SCHEMA_PATH,
+        username=rabbit_cfg.get("username", "permafrost"),
+        password=rabbit_cfg.get("password", "permafrost"),
+    )
+    sensors = cr1000_cfg.get("sensors", [])
+    fluid_fields = cr1000_cfg.get("fluid_fields")
+    fluid_exchange = cr1000_cfg.get("fluid_exchange", cr1000_module.FLUID_EXCHANGE)
+    if not fluid_fields:
+        influx_config = None
+    elif isinstance(influx_cfg, InfluxConfig):
+        influx_config = influx_cfg
+    elif influx_cfg:
+        influx_config = build_influx_config(influx_cfg)
+    else:
+        influx_config = None
+    return cr1000_module.CR1000PublisherServer(
+        port=str(cr1000_cfg.get("port", "COM3")),
+        baud_rate=int(cr1000_cfg.get("baud_rate", 115200)),
+        table_name=str(cr1000_cfg.get("table_name", "Table1")),
+        sensor_map=sensors if isinstance(sensors, list) else [],
+        rabbitmq_config=mq_config,
+        pakbus_addr=int(cr1000_cfg.get("pakbus_addr", 1)),
+        poll_interval_s=float(cr1000_cfg.get("poll_interval_s", 30.0)),
+        site_id=str(cr1000_cfg.get("site_id", "default")),
+        fluid_fields=fluid_fields if isinstance(fluid_fields, dict) else None,
+        fluid_exchange=str(fluid_exchange) if fluid_exchange else None,
+        influx_config=influx_config,
+        records_per_poll=int(cr1000_cfg.get("records_per_poll", 3)),
+        connect_timeout_s=float(cr1000_cfg.get("connect_timeout_s", 60.0)),
+        call_timeout_s=float(cr1000_cfg.get("call_timeout_s", 120.0)),
+        reconnect_delay_s=float(cr1000_cfg.get("reconnect_delay_s", 15.0)),
+    )
+
+
+def create_polyscience_control_server(
+    rabbit_cfg: Dict[str, str],
+    polyscience_cfg: Dict[str, object],
+    influx_cfg: Optional[Dict[str, str] | InfluxConfig] = None,
+):
+    """Build the PolyScience circulator actuation service (RS232 hardware bridge).
+
+    Consumes ``heater_command_message`` payloads (the same queue the
+    ``heater_actuation`` service publishes to) and drives the physical
+    controller. NOTE: its serial ``port`` must differ from the CR1000
+    publisher's port — pyserial opens ports exclusively. ``start_all_services``
+    enforces this at launch.
+    """
+    command_queue = str(polyscience_cfg.get("command_queue", polyscience_module.COMMAND_QUEUE))
+    command_config = _rabbit_config(rabbit_cfg, polyscience_module.COMMAND_SCHEMA, queue=command_queue)
+
+    if isinstance(influx_cfg, InfluxConfig):
+        influx_config = influx_cfg
+    elif influx_cfg:
+        influx_config = build_influx_config(influx_cfg)
+    else:
+        influx_config = None
+
+    action_map = polyscience_cfg.get("action_map")
+
+    return polyscience_module.PolyScienceControlServer(
+        port=str(polyscience_cfg.get("port", "COM3")),
+        baud_rate=int(polyscience_cfg.get("baud_rate", 57600)),
+        command_config=command_config,
+        influx_config=influx_config,
+        command_queue=command_queue,
+        action_map=action_map if isinstance(action_map, dict) else None,
+        setpoint_min_c=float(polyscience_cfg.get("setpoint_min_c", -30.0)),
+        setpoint_max_c=float(polyscience_cfg.get("setpoint_max_c", 50.0)),
+        serial_timeout_s=float(polyscience_cfg.get("serial_timeout_s", 3.0)),
+        inter_command_delay_s=float(polyscience_cfg.get("inter_command_delay_s", 0.2)),
+        open_retries=int(polyscience_cfg.get("open_retries", 3)),
+        open_retry_delay_s=float(polyscience_cfg.get("open_retry_delay_s", 2.0)),
+        verify_after_apply=bool(polyscience_cfg.get("verify_after_apply", True)),
+        stop_on_shutdown=bool(polyscience_cfg.get("stop_on_shutdown", True)),
+        site_id=str(polyscience_cfg.get("site_id", "default")),
+        dry_run=bool(polyscience_cfg.get("dry_run", False)),
     )
 
 
@@ -334,6 +497,9 @@ def initialize_service_config(
     fem_cfg: Dict[str, object],
     safety_cfg: Dict[str, object],
     heater_cfg: Dict[str, object],
+    cr1000_cfg: Optional[Dict[str, object]] = None,
+    pipe_boundary_cfg: Optional[Dict[str, object]] = None,
+    polyscience_cfg: Optional[Dict[str, object]] = None,
 ) -> Any:
     """
     Initialize and return a shared config dict using multiprocessing.Manager.
@@ -351,6 +517,9 @@ def initialize_service_config(
         "fem_cfg": fem_cfg,
         "safety_cfg": safety_cfg,
         "heater_cfg": heater_cfg,
+        "cr1000_cfg": cr1000_cfg or {},
+        "pipe_boundary_cfg": pipe_boundary_cfg or {},
+        "polyscience_cfg": polyscience_cfg or {},
     })
     return config_dict
 
@@ -432,6 +601,42 @@ def _safety_monitor_runner(*, ok_queue=None, config_dict=None) -> None:
         _get_service_config(config_dict, "influx_config"),
         _get_service_config(config_dict, "rabbit_cfg"),
         _get_service_config(config_dict, "safety_cfg"),
+    )
+    if ok_queue is not None:
+        ok_queue.put("OK")
+    server.start()
+
+
+def _cr1000_publisher_runner(*, ok_queue=None, config_dict=None) -> None:
+    """CR1000 hardware publisher service runner."""
+    server = create_cr1000_publisher_server(
+        _get_service_config(config_dict, "rabbit_cfg"),
+        _get_service_config(config_dict, "cr1000_cfg"),
+        _get_service_config(config_dict, "influx_config"),
+    )
+    if ok_queue is not None:
+        ok_queue.put("OK")
+    server.start()
+
+
+def _polyscience_control_runner(*, ok_queue=None, config_dict=None) -> None:
+    """PolyScience circulator actuation hardware bridge runner."""
+    server = create_polyscience_control_server(
+        _get_service_config(config_dict, "rabbit_cfg"),
+        _get_service_config(config_dict, "polyscience_cfg"),
+        _get_service_config(config_dict, "influx_config"),
+    )
+    if ok_queue is not None:
+        ok_queue.put("OK")
+    server.start()
+
+
+def _pipe_boundary_runner(*, ok_queue=None, config_dict=None) -> None:
+    """Pipe boundary enrichment service runner."""
+    server = create_pipe_boundary_server(
+        _get_service_config(config_dict, "influx_config"),
+        _get_service_config(config_dict, "rabbit_cfg"),
+        _get_service_config(config_dict, "pipe_boundary_cfg"),
     )
     if ok_queue is not None:
         ok_queue.put("OK")
