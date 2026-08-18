@@ -95,11 +95,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "input_exchange_type": "fanout",
         "output_queue": "permafrost.record.fem_inversion",
         "site_id": "default",
-        "invert_params": ["porosity", "lambda_thawed", "cap_s"],
+        # Only the soil parameters the FEM actually needs calibrated; the rest
+        # of the material dict is held fixed. Bounds are multipliers on the
+        # base value, so cap_s spans 395-1580, k_parameter 1.2-12 and lambda_s
+        # 1.76-7.02.
+        "invert_params": ["cap_s", "k_parameter", "lambda_s"],
         "relative_bounds": {
-            "porosity": [0.39, 0.42],
-            "lambda_thawed": [1.64, 3],
-            "cap_s": [2, 3],
+            "cap_s": [0.5, 2.0],
+            "k_parameter": [0.4, 4.0],
+            "lambda_s": [0.5, 2.0],
         },
         "loss": "mse",
         "window_size": 5,
@@ -200,6 +204,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "warm_start": True,
         "passthrough_until_ready": True,
         "publish_calibration": True,
+        # Record the model's predicted outlet next to the measured inlet/outlet
+        # on every fluid sample, so the pipe model can be validated in the
+        # dashboard. One extra pipe simulation per fluid message.
+        "publish_outlet_validation": True,
     },
     "fem_forecast": {
         "input_queue": "permafrost.record.boundary.2d",
@@ -229,21 +237,30 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "right": "DT_model_right_nodes.txt",
         },
         "material": {
-            "porosity": 0.42,
-            "rho_s": 2700.0,
+            "porosity": 0.43,
+            "rho_s": 2650.0,
             "rho_w": 1000.0,
-            "rho_i": 920.0,
+            "rho_i": 910.0,
             "cap_s": 790.0,
             "cap_w": 4180.0,
-            "cap_i": 2090.0,
+            "cap_i": 1930.0,
             "latent_heat": 334000.0,
-            "k_parameter": 5.0,
+            "k_parameter": 3.0,
             "tr_k": 273.15,
-            "lambda_thawed": 1.64,
-            "lambda_frozen": 2.96,
+            # Bulk conductivity is mixed from the grain/water/ice values and
+            # the phase saturations (see FEMSolver2D._bulk_conductivity), so
+            # lambda_s replaces the old lambda_thawed/lambda_frozen pair.
+            "lambda_s": 3.51,
+            "lambda_w": 0.56,
+            "lambda_i": 2.24,
         },
         "solver": {
-            "dt_seconds": 36.0,
+            # Must divide the sensor cadence (CR1000 logs every 30 s). advance()
+            # takes round(horizon/dt) whole steps of dt, so a dt that does not
+            # divide the message interval integrates the wrong amount of time:
+            # at dt=36 s a 30 s interval became one 36 s step (+20% heating) and
+            # a 4x-strided 120 s interval became three (-10%).
+            "dt_seconds": 30.0,
             "max_iterations": 25,
             "tol_r": 1e-6,
             "temperature_offset_k": 273.15,
@@ -253,6 +270,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "save_field_csv_default": False,
         "include_field_default": False,
         "sticky_material_override": True,
+        # Also march an uncalibrated twin (fixed material parameters, inversion
+        # overrides ignored) and publish its field to fem_temperature_2d_baseline,
+        # so the dashboard can show what the inversion is buying. Costs one extra
+        # FEM solve per boundary message; set False to switch it off.
+        "run_baseline": True,
     },
     "safety_monitor": {
         "thaw_input_queue": "permafrost.record.thaw_front.2d",

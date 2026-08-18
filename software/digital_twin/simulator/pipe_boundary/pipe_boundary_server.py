@@ -39,6 +39,7 @@ from software.tools.run_loop_thermal_case import (
     PipeModelConfig,
     calibrate_pipe,
     effective_interface_temperature,
+    evaluate_pipe,
     interface_temperature_profile,
 )
 from software.utils.logging_setup import get_logger
@@ -99,6 +100,7 @@ class PipeBoundaryServer:
         warm_start: bool = True,
         passthrough_until_ready: bool = True,
         publish_calibration: bool = True,
+        publish_outlet_validation: bool = True,
     ) -> None:
         self.logger = get_logger("PipeBoundaryServer")
         self.influx_config = influx_config or InfluxConfig()
@@ -158,6 +160,11 @@ class PipeBoundaryServer:
         self.use_warm_start = bool(warm_start)
         self.passthrough_until_ready = bool(passthrough_until_ready)
         self.publish_calibration = bool(publish_calibration)
+        # Re-run the pipe model over the current window purely to record the
+        # outlet it predicts against the measured one. Costs one extra pipe
+        # simulation per fluid message; set False if the fluid stream is fast
+        # enough for that to matter.
+        self.publish_outlet_validation = bool(publish_outlet_validation)
 
         # Shared state (guarded by _lock).
         self._lock = Lock()
@@ -332,6 +339,24 @@ class PipeBoundaryServer:
             self._effective_temp_c = eff
             self._effective_profile = profile
             self._effective_time_hours = latest_th
+
+        # Validation record: what the calibrated model says the outlet should be,
+        # stored next to the measured inlet/outlet that drove it. This is the
+        # only place the simulated outlet is persisted -- the calibration record
+        # keeps aggregate rmse/mae, not the series.
+        if self.publish_outlet_validation and self.influx is not None:
+            try:
+                evaluation = evaluate_pipe(params, times_s, tin, tout, self.pipe_config)
+                predicted = np.asarray(evaluation["pred_outlet_c"], dtype=float)
+                self.influx.write_pipe_outlet_validation(
+                    time_hours=latest_th,
+                    t_inlet_c=float(tin[-1]),
+                    t_outlet_meas_c=float(tout[-1]),
+                    t_outlet_sim_c=float(predicted[-1]),
+                    site=self.site_id,
+                )
+            except Exception as exc:  # noqa: BLE001 - diagnostic only
+                self.logger.error("Pipe outlet validation failed: %s", exc)
 
         if calib_result is not None:
             self.logger.info(

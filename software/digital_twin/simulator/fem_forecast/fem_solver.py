@@ -31,19 +31,28 @@ class FEMMeshConfig:
 
 @dataclass(frozen=True)
 class MaterialProps:
-    """Material and thermal properties"""
-    porosity: float = 0.42
-    rho_s: float = 2700.0
+    """Material and thermal properties.
+
+    Bulk thermal conductivity is not prescribed as a thawed/frozen pair any
+    more. It is mixed from the three phases (solid grains, water, ice) via a
+    geometric mean, so the only conductivity unknown is the grain conductivity
+    ``lambda_s`` -- which is what the inversion service estimates. See
+    ``_bulk_conductivity`` for the mixing law and the calibration of the
+    default value.
+    """
+    porosity: float = 0.43
+    rho_s: float = 2650.0
     rho_w: float = 1000.0
-    rho_i: float = 920.0
+    rho_i: float = 910.0
     cap_s: float = 790.0
     cap_w: float = 4180.0
-    cap_i: float = 2090.0
+    cap_i: float = 1930.0
     latent_heat: float = 3.34e5
-    k_parameter: float = 5.0
+    k_parameter: float = 3.0
     tr_k: float = 273.15
-    lambda_thawed: float = 1.64
-    lambda_frozen: float = 2.96
+    lambda_s: float = 3.51
+    lambda_w: float = 0.56
+    lambda_i: float = 2.24
 
 
 @dataclass(frozen=True)
@@ -84,6 +93,16 @@ class FEMSolver2D:
         self.mesh_cfg = mesh
         self.material = material
         self.solver = solver
+
+        # Conductivities are mixed geometrically (see _bulk_conductivity), which
+        # is only defined for strictly positive values -- a non-positive one
+        # would silently yield a complex/NaN conductivity deep inside assembly.
+        for name in ("lambda_s", "lambda_w", "lambda_i"):
+            if float(getattr(material, name)) <= 0.0:
+                raise ValueError(f"{name} must be > 0 (got {getattr(material, name)}).")
+        # Grain term of the mixture: constant per material, so hoisted out of
+        # the element/quadrature loop.
+        self._lambda_solid_factor = float(material.lambda_s) ** (1.0 - float(material.porosity))
 
         # Load mesh arrays
         self.node = self._load_array(mesh.mesh_dir / mesh.node_file, dtype=float)
@@ -302,6 +321,32 @@ class FEMSolver2D:
             return None
         return np.full(node_ids.shape[0], self._to_kelvin(float(temperature)))
 
+    def _bulk_conductivity(self, sw: float, si: float) -> float:
+        """Three-phase bulk conductivity from a geometric-mean mixing law.
+
+            landa = lambda_s^(1-poro) * lambda_w^(poro*sw) * lambda_i^(poro*si)
+
+        This replaces the former ``lambda_thawed``/``lambda_frozen`` switch at
+        Tr. Two reasons: the conductivity is now continuous through the
+        phase-change band, following the same smooth ice/water saturations that
+        already drive the capacity term instead of jumping at the threshold;
+        and a single grain conductivity carries both regimes, so the inversion
+        estimates one physical parameter rather than two correlated ones.
+
+        The default ``lambda_s`` = 3.51 W/(m K) is the measured grain value. At
+        poro = 0.43 the law gives 1.59 W/(m K) fully thawed (sw = 1) and
+        2.89 W/(m K) fully frozen (si = 1).
+
+        Air is not a phase here: the sample is treated as saturated, so the pore
+        space is split between water and ice only and ``lambda_a`` never enters.
+        """
+        poro = self.material.porosity
+        return float(
+            self._lambda_solid_factor
+            * self.material.lambda_w ** (poro * sw)
+            * self.material.lambda_i ** (poro * si)
+        )
+
     def _thaw_threshold_k(self) -> float:
         return self._to_kelvin(self.solver.thaw_threshold_c)
 
@@ -325,8 +370,18 @@ class FEMSolver2D:
     # ---------------------------
 
     #TODO  use cupy for gpu bases matmul, move away from nested loops
-    def _assemble_system(self, boundary_snapshot: dict) -> tuple[sp.csr_matrix, np.ndarray, dict[int, float]]:
+    def _assemble_system(
+        self,
+        boundary_snapshot: dict,
+        t_prev: np.ndarray | None = None,
+    ) -> tuple[sp.csr_matrix, np.ndarray, dict[int, float]]:
         """Assemble global stiffness matrix K and force vector f.
+
+        ``self.T`` supplies the temperature at which the nonlinear material
+        properties are evaluated (the latest Newton iterate). ``t_prev`` is the
+        *previous time step* field that feeds the transient term ``C@t_prev/dt``;
+        it must stay pinned across the Newton iterations of one step. Defaults
+        to ``self.T`` for callers assembling outside a Newton loop.
 
         This implements the baseline's assembly logic:
           1. Boundary condition assembly (robin/neumann on edges)
@@ -447,9 +502,10 @@ class FEMSolver2D:
                 #   si = 1.0 / (1.0 + X_exp)
                 #   dsidT = -k_parameter * X_exp / (1.0 + X_exp)**2
                 #   sw = 1.0 - si
-                #   landa = (T_temp >= 273.15) ? 1.64 : 2.96
                 #   rhoc_eff = (1-poro)*rho_s*cap_s + (poro*sw)*rho_w*cap_w + (poro*si)*rho_i*cap_i
-                # With clamping to prevent exponential overflow
+                # With clamping to prevent exponential overflow. The baseline's
+                # landa = (T_temp >= 273.15) ? 1.64 : 2.96 switch is replaced by
+                # the lambda_s-based mixture below.
                 exponent = self.material.k_parameter * (T_temp - self.material.tr_k)
                 exponent = np.clip(exponent, -100, 100)
                 X_exp = np.exp(exponent)
@@ -457,10 +513,7 @@ class FEMSolver2D:
                 dsidT = -self.material.k_parameter * X_exp / (1.0 + X_exp) ** 2
                 sw = 1.0 - si
 
-                if T_temp >= self.material.tr_k:
-                    landa = self.material.lambda_thawed
-                else:
-                    landa = self.material.lambda_frozen
+                landa = self._bulk_conductivity(sw, si)
 
                 rhoc_eff = (
                     (1.0 - self.material.porosity) * self.material.rho_s * self.material.cap_s
@@ -494,7 +547,8 @@ class FEMSolver2D:
         else:
             K_robin = sp.csr_matrix((self.numnode, self.numnode))
         A = K_matrix + K_robin + (C_matrix / float(self.solver.dt_seconds))
-        b = fT + (C_matrix @ self.T) / float(self.solver.dt_seconds)
+        transient_field = self.T if t_prev is None else t_prev
+        b = fT + (C_matrix @ transient_field) / float(self.solver.dt_seconds)
         return A, b, dirichlet_map
 
     # ---------------------------
@@ -539,25 +593,36 @@ class FEMSolver2D:
         loop was a no-op: spsolve (direct) drives the linear residual to machine
         precision in one step, so additional iterations added nothing.
 
-        baseline:
-          A = K_matrix + (C_matrix / dt)
-          b = fT + (C_matrix @ Xn) / dt
-          while not converged:
-              dX = spla.spsolve(A_bc, residual)
-              X_new = X_new + dX
-              residual = b - A @ X_new
-              if norm(residual) < tol_r: converged=True
+        The previous-step field ``Xn`` is captured once and held fixed for the
+        whole iteration, matching the reference formulation
+
+            residual = Fext + C*Xn/dt - (K + C/dt)*X_new
+
+        Letting the transient term follow the iterate instead (assembling
+        ``C@X_new/dt``) collapses the residual to the *steady-state* form
+        ``fT - K@X_new``, so every extra iteration marches the step toward
+        equilibrium rather than toward the backward-Euler solution. That is
+        invisible at ``max_iterations=1`` and progressively over-diffuses the
+        field at higher iteration counts.
+
+        Convergence is measured relative to ``||b||`` (the reference's ``rext``).
+        An absolute test cannot work here: the residual carries units of watts
+        and is O(1e3-1e6), so a fixed 1e-6 threshold never trips.
         """
-        X_new = self.T.copy()
+        Xn = self.T.copy()
+        X_new = Xn.copy()
 
         for _ in range(self.solver.max_iterations):
             # Reassemble with the current temperature estimate so that the
-            # nonlinear material properties reflect the latest X_new.
+            # nonlinear material properties reflect the latest X_new, while the
+            # transient term stays anchored to the previous step (Xn).
             self.T = X_new
-            A, b, dirichlet_map = self._assemble_system(boundary_snapshot)
+            A, b, dirichlet_map = self._assemble_system(boundary_snapshot, t_prev=Xn)
             A_bc, b_bc = self._apply_dirichlet(A, b, dirichlet_map)
             residual = b_bc - A_bc @ X_new
-            if np.linalg.norm(residual) < self.solver.tol_r:
+            ref_norm = float(np.linalg.norm(b_bc))
+            rel_residual = float(np.linalg.norm(residual)) / (ref_norm if ref_norm > 0.0 else 1.0)
+            if rel_residual < self.solver.tol_r:
                 break
             dX = spla.spsolve(A_bc, residual)        # replace spsolve with cuSPARSE, a faster GPU based linear solver
             X_new = X_new + dX
