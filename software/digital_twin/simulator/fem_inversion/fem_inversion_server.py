@@ -1,4 +1,26 @@
-"""FEM-based inversion service for 2D sensor snapshots."""
+"""FEM-based inversion service for 2D sensor snapshots.
+
+Purpose: sharpen the FEM forecast by replacing literature soil parameters with
+values calibrated against the live sensor stream. The service repeatedly runs
+the same forward FEM the forecast service uses, over a short window of recent
+snapshots, and fits the soil parameters that minimise the mismatch with the
+measured temperatures. The result is published on the inversion queue and --
+when ``publish_material_override_boundary`` is on -- pushed to the forecast as
+a ``material_override`` on the boundary snapshot.
+
+Only the parameters in ``INVERTIBLE_PARAMS`` are estimated:
+
+* ``cap_s``       -- specific heat of the solid grains
+* ``k_parameter`` -- sharpness of the freezing curve around ``tr_k``
+* ``lambda_s``    -- thermal conductivity of the solid grains
+
+Everything else in ``base_params`` (porosity, densities, water/ice properties,
+latent heat, ``tr_k``) is held fixed at its measured/literature value and just
+travels through to the forward model. Note that the solver mixes the bulk
+conductivity from ``lambda_s``/``lambda_w``/``lambda_i`` and the phase
+saturations, so the old ``lambda_thawed``/``lambda_frozen`` pair no longer
+exists in either model or inversion.
+"""
 
 from __future__ import annotations
 
@@ -24,6 +46,12 @@ FEM_BOUNDARY_QUEUE = "permafrost.record.boundary.2d"
 SENSOR_SCHEMA = Path(__file__).resolve().parents[2] / "communication" / "schemas" / "sensor_message_2d.json"
 INVERSION_SCHEMA = Path(__file__).resolve().parents[2] / "communication" / "schemas" / "fem_inversion_output_message.json"
 FEM_BOUNDARY_SCHEMA = Path(__file__).resolve().parents[2] / "communication" / "schemas" / "boundary_condition_message.json"
+
+# Soil parameters this service is allowed to estimate. Anything outside this
+# set is fixed by measurement/literature and must not be handed to the
+# optimiser, however the config asks for it.
+INVERTIBLE_PARAMS = ("cap_s", "k_parameter", "lambda_s")
+DEFAULT_INVERT_PARAMS = list(INVERTIBLE_PARAMS)
 
 
 class FEMInversionServer:
@@ -77,7 +105,7 @@ class FEMInversionServer:
         )
 
         self.site_id = site_id
-        self.invert_params = list(invert_params or ["porosity", "lambda_thawed", "cap_s"])
+        self.invert_params = self._resolve_invert_params(invert_params)
         self.base_params = self._build_base_params(base_params)
         self.relative_bounds = self._build_bounds(relative_bounds)
         self.loss = str(loss).strip().lower()
@@ -113,20 +141,53 @@ class FEMInversionServer:
         self.mq_fem_in: Optional[RabbitMQClient] = None
         self.influx: Optional[InfluxHelper] = None
 
+    def _resolve_invert_params(self, invert_params: list[str] | None) -> list[str]:
+        """Keep only parameters this service is allowed to estimate.
+
+        Names outside ``INVERTIBLE_PARAMS`` are dropped with a warning rather
+        than raising, so a stale config (e.g. one still asking for the removed
+        ``lambda_thawed``, or for the now-fixed ``porosity``) degrades to the
+        default set instead of taking the service down at startup.
+        """
+        requested = [str(name) for name in (invert_params or DEFAULT_INVERT_PARAMS)]
+        resolved: list[str] = []
+        rejected: list[str] = []
+        for name in requested:
+            if name not in INVERTIBLE_PARAMS:
+                rejected.append(name)
+            elif name not in resolved:
+                resolved.append(name)
+
+        if rejected:
+            self.logger.warning(
+                "Ignoring non-invertible parameter(s) %s; invertible set is %s",
+                rejected,
+                list(INVERTIBLE_PARAMS),
+            )
+        if not resolved:
+            self.logger.warning("No invertible parameters configured; falling back to %s", DEFAULT_INVERT_PARAMS)
+            return list(DEFAULT_INVERT_PARAMS)
+        return resolved
+
     def _build_base_params(self, base_params: dict | None) -> dict[str, float]:
+        # Fixed properties (measured or from literature) followed by the three
+        # inverted unknowns. Only the latter are handed to the optimiser; see
+        # INVERTIBLE_PARAMS and the module docstring.
         defaults = {
-            "porosity": 0.42,
-            "rho_s": 2700.0,
+            "porosity": 0.43,
+            "rho_s": 2650.0,
             "rho_w": 1000.0,
-            "rho_i": 920.0,
-            "cap_s": 790.0,
+            "rho_i": 910.0,
             "cap_w": 4180.0,
-            "cap_i": 2090.0,
+            "cap_i": 1930.0,
             "latent_heat": 334000.0,
-            "k_parameter": 5.0,
             "tr_k": 273.15,
-            "lambda_thawed": 1.64,
-            "lambda_frozen": 2.96,
+            "lambda_w": 0.56,
+            "lambda_i": 2.24,
+            # Inverted:
+            "cap_s": 790.0,
+            "k_parameter": 3.0,
+            "lambda_s": 3.51,
         }
         if not isinstance(base_params, dict):
             return defaults
@@ -218,7 +279,17 @@ class FEMInversionServer:
                 return False
         return True
 
-    def _build_observation_window(self) -> tuple[list[float], list[dict], dict[str, list[float]]] | None:
+    def _build_observation_window(
+        self,
+    ) -> tuple[list[float], list[dict], dict[str, list[float]], list[dict]] | None:
+        """Assemble the fitting window: times, positions, observations, and IC.
+
+        The fourth element is the *first* snapshot of the window. Times are
+        relative to that snapshot, and every forward FEM evaluation starts from
+        it, so it is the measured initial condition the model must be seeded
+        with -- otherwise the objective compares real temperature histories
+        against runs that all begin from a flat field.
+        """
         if len(self._snapshots) < self.min_snapshots:
             return None
 
@@ -260,9 +331,13 @@ class FEMInversionServer:
             for sid in sorted_ids
         ]
 
-        return times_hours, positions, obs_series
+        ic_sensors = deepcopy(window[0]["sensors"])
 
-    def _prepare_inversion_job(self, now_utc: datetime) -> tuple[float, dict, list[float], list[dict], dict[str, list[float]]] | None:
+        return times_hours, positions, obs_series, ic_sensors
+
+    def _prepare_inversion_job(
+        self, now_utc: datetime
+    ) -> tuple[float, dict, list[float], list[dict], dict[str, list[float]], list[dict]] | None:
         if not self._snapshots:
             return None
         latest = self._snapshots[-1]
@@ -294,12 +369,12 @@ class FEMInversionServer:
             self.logger.warning("Inversion skipped: unable to assemble a valid observation window.")
             return None
 
-        times_hours, positions, obs_series = window
+        times_hours, positions, obs_series, ic_sensors = window
         trigger_snapshot = deepcopy(latest)
         self._inversion_running = True
         self._pending_recheck = False
 
-        return latest_time, trigger_snapshot, times_hours, positions, obs_series
+        return latest_time, trigger_snapshot, times_hours, positions, obs_series, ic_sensors
 
     def _start_inversion_thread(
         self,
@@ -309,6 +384,7 @@ class FEMInversionServer:
         times_hours: list[float],
         positions: list[dict],
         obs_series: dict[str, list[float]],
+        ic_sensors: list[dict],
     ) -> None:
         worker = Thread(
             target=self._run_inversion_job,
@@ -318,6 +394,7 @@ class FEMInversionServer:
                 "times_hours": times_hours,
                 "positions": positions,
                 "obs_series": obs_series,
+                "ic_sensors": ic_sensors,
             },
             daemon=True,
         )
@@ -331,18 +408,20 @@ class FEMInversionServer:
         times_hours: list[float],
         positions: list[dict],
         obs_series: dict[str, list[float]],
+        ic_sensors: list[dict],
     ) -> None:
         self.logger.info(
-            "Starting inversion (time=%.3fh, snapshots=%d, sensors=%d, points=%d)",
+            "Starting inversion (time=%.3fh, snapshots=%d, sensors=%d, points=%d, ic_sensors=%d)",
             trigger_time,
             len(times_hours),
             len(positions),
             len(times_hours) * len(positions),
+            len(ic_sensors),
         )
 
         start = datetime.utcnow()
         try:
-            best_params, info = self._run_inversion(times_hours, positions, obs_series)
+            best_params, info = self._run_inversion(times_hours, positions, obs_series, ic_sensors)
             self._publish_result(
                 sensor_msg=trigger_snapshot,
                 best_params=best_params,
@@ -376,12 +455,14 @@ class FEMInversionServer:
                     next_times,
                     next_positions,
                     next_obs_series,
+                    next_ic_sensors,
                 ) = restart_job
                 self._start_inversion_thread(
                     trigger_time=next_time,
                     trigger_snapshot=next_snapshot,
                     times_hours=next_times,
                     positions=next_positions,
+                    ic_sensors=next_ic_sensors,
                     obs_series=next_obs_series,
                 )
 
@@ -396,7 +477,15 @@ class FEMInversionServer:
         params: dict[str, float],
         positions: list[dict],
         times_hours: list[float],
+        ic_sensors: list[dict] | None = None,
     ) -> dict[str, list[float]]:
+        """Forward-model the sensor histories for one candidate parameter set.
+
+        Each horizon is integrated from the same measured initial field
+        (``ic_sensors``, the first snapshot of the window) rather than from the
+        uniform fallback temperature, so the residual the optimiser minimises
+        reflects the parameters instead of a wrong starting state.
+        """
         series = {pos["sensor_id"]: [] for pos in positions}
         for t in times_hours:
             result = FEM(
@@ -405,6 +494,7 @@ class FEMInversionServer:
                 boundary_snapshot=None,
                 horizon_hours=float(t),
                 return_field=False,
+                sensors=ic_sensors,
             )
             for item in result["temperatures"]:
                 sid = item["sensor_id"]
@@ -433,10 +523,17 @@ class FEMInversionServer:
                 scales.append(min(max(float(self._last_best_scales[idx]), lo), hi))
             return scales
 
+        # Cold start: begin at the base values themselves (scale 1.0), clamped
+        # into the bounds in case a bound excludes 1.0. The previous behaviour
+        # drew a random point in the box, which made the very first fit of a run
+        # jump away from the measured material set for no reason the data
+        # supports, and made two runs on identical inputs disagree. Starting at
+        # the base means the first result reads as a refinement of the measured
+        # values, and every later update warm-starts from the previous fit above.
         scales = []
         for name in self.invert_params:
             lo, hi = self.relative_bounds[name]
-            scales.append(self._rng.uniform(lo, hi))
+            scales.append(min(max(1.0, lo), hi))
         return scales
 
     def _run_inversion(
@@ -444,6 +541,7 @@ class FEMInversionServer:
         times_hours: list[float],
         positions: list[dict],
         obs_series: dict[str, list[float]],
+        ic_sensors: list[dict] | None = None,
     ) -> tuple[dict[str, float], dict[str, object]]:
         base_inv_values = {name: float(self.base_params[name]) for name in self.invert_params}
         y0 = self._initial_scales()
@@ -456,7 +554,7 @@ class FEMInversionServer:
             nonlocal best_eval_loss
             self._eval_count += 1
             params = self._normalized_to_params(scales, base_inv_values)
-            pred_series = self._generate_series(params, positions, times_hours)
+            pred_series = self._generate_series(params, positions, times_hours, ic_sensors)
             loss_value = self._compute_loss(pred_series, obs_series)
             if np.isfinite(loss_value):
                 best_eval_loss = min(best_eval_loss, loss_value)
@@ -601,6 +699,7 @@ class FEMInversionServer:
             times_hours,
             positions,
             obs_series,
+            ic_sensors,
         ) = job
         self._start_inversion_thread(
             trigger_time=trigger_time,
@@ -608,6 +707,7 @@ class FEMInversionServer:
             times_hours=times_hours,
             positions=positions,
             obs_series=obs_series,
+            ic_sensors=ic_sensors,
         )
 
     def setup(self) -> None:

@@ -11,7 +11,11 @@ from typing import Optional
 import numpy as np
 
 from software.digital_twin.communication.messaging import RabbitMQClient, RabbitMQConfig, resolve_queue_config
-from software.digital_twin.data_access.influx_utils import InfluxConfig, InfluxHelper
+from software.digital_twin.data_access.influx_utils import (
+    FEM_TEMPERATURE_BASELINE_MEASUREMENT,
+    InfluxConfig,
+    InfluxHelper,
+)
 from software.digital_twin.simulator.fem_forecast.fem_solver import (
     FEMMeshConfig,
     FEMSolver2D,
@@ -71,6 +75,7 @@ class FEMForecastServer:
         include_field_default: bool = False,
         sticky_material_override: bool = True,
         field_csv_dir: str | None = None,
+        run_baseline: bool = False,
     ) -> None:
         self.logger = get_logger("FEMForecastServer")
         self.influx_config = influx_config or InfluxConfig()
@@ -100,11 +105,20 @@ class FEMForecastServer:
         self.include_field_default = self._as_bool(include_field_default, False)
         self.sticky_material_override = self._as_bool(sticky_material_override, True)
         self.field_csv_dir = field_csv_dir
+        # Baseline twin: a second solver marched on the same boundary snapshots
+        # and the same initial condition, but always with the configured
+        # material parameters -- material_override from the inversion service is
+        # never applied to it. Its field is published to a separate Influx
+        # measurement so the dashboard can show "with inversion" against
+        # "without inversion" and the difference is attributable to the
+        # calibration alone.
+        self.run_baseline = self._as_bool(run_baseline, False)
 
         self.mq_in: Optional[RabbitMQClient] = None
         self.mq_out: Optional[RabbitMQClient] = None
         self.influx: Optional[InfluxHelper] = None
         self._solver: Optional[FEMSolver2D] = None
+        self._baseline_solver: Optional[FEMSolver2D] = None
         self._last_material_override: dict[str, float] | None = None
         # Observed sensor layout (from the boundary message passthrough), used to
         # sample the FEM field at the same positions as the observations so the
@@ -178,30 +192,42 @@ class FEMForecastServer:
     def _material_from_dict(self, material_dict: dict) -> MaterialProps:
         """Construct MaterialProps from dict with same defaults as _build_solver."""
         return MaterialProps(
-            porosity=float(material_dict.get("porosity", 0.42)),
-            rho_s=float(material_dict.get("rho_s", 2700.0)),
+            porosity=float(material_dict.get("porosity", 0.43)),
+            rho_s=float(material_dict.get("rho_s", 2650.0)),
             rho_w=float(material_dict.get("rho_w", 1000.0)),
-            rho_i=float(material_dict.get("rho_i", 920.0)),
+            rho_i=float(material_dict.get("rho_i", 910.0)),
             cap_s=float(material_dict.get("cap_s", 790.0)),
             cap_w=float(material_dict.get("cap_w", 4180.0)),
-            cap_i=float(material_dict.get("cap_i", 2090.0)),
+            cap_i=float(material_dict.get("cap_i", 1930.0)),
             latent_heat=float(material_dict.get("latent_heat", 3.34e5)),
-            k_parameter=float(material_dict.get("k_parameter", 5.0)),
+            k_parameter=float(material_dict.get("k_parameter", 3.0)),
             tr_k=float(material_dict.get("tr_k", 273.15)),
-            lambda_thawed=float(material_dict.get("lambda_thawed", 1.64)),
-            lambda_frozen=float(material_dict.get("lambda_frozen", 2.96)),
+            lambda_s=float(material_dict.get("lambda_s", 3.51)),
+            lambda_w=float(material_dict.get("lambda_w", 0.56)),
+            lambda_i=float(material_dict.get("lambda_i", 2.24)),
         )
 
-    def _write_field_csv(self, field: FieldSnapshot, horizon_hours: float, field_csv_dir: str | None = None) -> str:
-        """Append one horizontal row per timestep using D*-W* sensor-style columns."""
+    def _write_field_csv(
+        self,
+        field: FieldSnapshot,
+        horizon_hours: float,
+        field_csv_dir: str | None = None,
+        variant: str | None = None,
+    ) -> str:
+        """Append one horizontal row per timestep using D*-W* sensor-style columns.
+
+        ``variant`` suffixes the filename so the baseline twin never appends to
+        the calibrated run's CSV.
+        """
         if field_csv_dir is None:
             field_csv_dir = "artifacts/fem_fields"
-        
+
         field_path = Path(field_csv_dir)
         field_path.mkdir(parents=True, exist_ok=True)
-        
+
         site_str = str(self.site_id).replace("/", "_").replace(" ", "_")
-        filename = f"fem_field_{site_str}.csv"
+        suffix = f"_{variant}" if variant else ""
+        filename = f"fem_field_{site_str}{suffix}.csv"
         filepath = field_path / filename
         write_header = (not filepath.exists()) or filepath.stat().st_size == 0
 
@@ -315,18 +341,19 @@ class FEMForecastServer:
             node_sets=self.node_sets,
         )
         material = MaterialProps(
-            porosity=float(self.material_config.get("porosity", 0.42)),
-            rho_s=float(self.material_config.get("rho_s", 2700.0)),
+            porosity=float(self.material_config.get("porosity", 0.43)),
+            rho_s=float(self.material_config.get("rho_s", 2650.0)),
             rho_w=float(self.material_config.get("rho_w", 1000.0)),
-            rho_i=float(self.material_config.get("rho_i", 920.0)),
+            rho_i=float(self.material_config.get("rho_i", 910.0)),
             cap_s=float(self.material_config.get("cap_s", 790.0)),
             cap_w=float(self.material_config.get("cap_w", 4180.0)),
-            cap_i=float(self.material_config.get("cap_i", 2090.0)),
+            cap_i=float(self.material_config.get("cap_i", 1930.0)),
             latent_heat=float(self.material_config.get("latent_heat", 3.34e5)),
-            k_parameter=float(self.material_config.get("k_parameter", 5.0)),
+            k_parameter=float(self.material_config.get("k_parameter", 3.0)),
             tr_k=float(self.material_config.get("tr_k", 273.15)),
-            lambda_thawed=float(self.material_config.get("lambda_thawed", 1.64)),
-            lambda_frozen=float(self.material_config.get("lambda_frozen", 2.96)),
+            lambda_s=float(self.material_config.get("lambda_s", 3.51)),
+            lambda_w=float(self.material_config.get("lambda_w", 0.56)),
+            lambda_i=float(self.material_config.get("lambda_i", 2.24)),
         )
         solver = SolverConfig(
             dt_seconds=float(self.solver_config.get("dt_seconds", 36.0)),
@@ -354,6 +381,12 @@ class FEMForecastServer:
                 "FEM initial condition seeded from sensor snapshot (%d sensors).",
                 len(sensors),
             )
+        # The baseline twin must start from the identical initial field, or the
+        # two runs would differ for reasons other than the material parameters.
+        if self.run_baseline:
+            if self._baseline_solver is None:
+                self._baseline_solver = self._build_solver()
+            self._baseline_solver.seed_initial_field(sensors)
 
     def _resolve_step_hours(self, time_hours: float) -> float:
         """Time to advance for this message.
@@ -423,10 +456,23 @@ class FEMForecastServer:
         # Optionally capture field snapshot
         field_snapshot = None
         if include_field or save_field_csv:
+            # In tracking mode the field represents the *observation* time, not
+            # observation + step. advance() tags the solver with the end of the
+            # step, and _process_message corrects the solver afterwards -- but a
+            # snapshot taken here has already copied the value, so it would be
+            # written to Influx and CSV one step ahead of the sensor series.
+            # Every downstream join is on time_hours, so that offset silently
+            # mispairs or drops rows and inflates the apparent FEM error.
+            snapshot_time = float(self._solver.time_hours or 0.0)
+            if self.track_observed_time:
+                try:
+                    snapshot_time = float(boundary_snapshot["time_hours"])
+                except (KeyError, TypeError, ValueError):
+                    pass
             field_snapshot = FieldSnapshot(
                 node_xy=self._solver.node.copy(),
                 temperature=self._solver.T.copy(),
-                time_hours=float(self._solver.time_hours or 0.0),
+                time_hours=snapshot_time,
                 units="K",  # FEMSolver2D stores Kelvin internally
             )
         
@@ -436,6 +482,43 @@ class FEMForecastServer:
             csv_path = self._write_field_csv(field_snapshot, self.horizon_hours, field_csv_dir)
         
         return result, field_snapshot, csv_path
+
+    def _run_baseline_forecast(
+        self,
+        boundary_snapshot: dict,
+        step_hours: float | None = None,
+        save_field_csv: bool = False,
+        field_csv_dir: str | None = None,
+    ) -> tuple[ForecastResult, FieldSnapshot] | None:
+        """Advance the uncalibrated twin and snapshot its field.
+
+        Same mesh, same boundary snapshot, same step and same seeded initial
+        condition as the calibrated run -- the only difference is that the
+        material stays at its configured values, so ``material_override`` from
+        the inversion service is deliberately never applied here. Any gap
+        between the two fields is therefore attributable to the inversion.
+        """
+        if not self.run_baseline:
+            return None
+        if self._baseline_solver is None:
+            self._baseline_solver = self._build_solver()
+
+        hz = self.horizon_hours if step_hours is None else step_hours
+        if hz > 0.0:
+            self._baseline_solver.advance(boundary_snapshot, horizon_hours=hz)
+        radius_max_m, radius_avg_m, points = self._baseline_solver.compute_thaw_metrics()
+        field = FieldSnapshot(
+            node_xy=self._baseline_solver.node.copy(),
+            temperature=self._baseline_solver.T.copy(),
+            time_hours=float(self._baseline_solver.time_hours or 0.0),
+            units="K",
+        )
+        if save_field_csv:
+            self._write_field_csv(field, self.horizon_hours, field_csv_dir, variant="baseline")
+        return (
+            ForecastResult(radius_max_m=radius_max_m, radius_avg_m=radius_avg_m, points=points),
+            field,
+        )
 
     def compute_temperatures(
         self,
@@ -541,7 +624,35 @@ class FEMForecastServer:
             if self.track_observed_time and self._solver is not None:
                 self._solver.time_hours = time_hours
             self._last_time_hours = time_hours
-            
+
+            # Uncalibrated reference run. Isolated in its own try block: it is a
+            # diagnostic, so a failure here must not cost us the live forecast.
+            baseline_field: FieldSnapshot | None = None
+            if self.run_baseline:
+                try:
+                    baseline = self._run_baseline_forecast(
+                        msg,
+                        step_hours=step_hours,
+                        save_field_csv=save_field_csv,
+                        field_csv_dir=field_csv_dir,
+                    )
+                    if baseline is not None:
+                        baseline_result, baseline_field = baseline
+                        if self.track_observed_time:
+                            if self._baseline_solver is not None:
+                                self._baseline_solver.time_hours = time_hours
+                            baseline_field.time_hours = time_hours
+                        self.logger.info(
+                            "Baseline (no-inversion) run: r_max=%s r_avg=%s | calibrated: r_max=%s r_avg=%s",
+                            baseline_result.radius_max_m,
+                            baseline_result.radius_avg_m,
+                            result.radius_max_m,
+                            result.radius_avg_m,
+                        )
+                except Exception as exc:
+                    self.logger.error("Baseline forecast failed: %s", exc, exc_info=True)
+
+
             override_keys = sorted(material_override.keys()) if material_override else []
             self.logger.info(
                 "Received boundary snapshot (t=%.2fh, boundaries=%d, override_source=%s, override_keys=%s)",
@@ -588,6 +699,14 @@ class FEMForecastServer:
                     horizon_hours=self.horizon_hours,
                     sensors=self._sample_field_at_sensor_grid(field_snapshot),
                     site=self.site_id,
+                )
+            if baseline_field is not None:
+                self.influx.write_fem_temperature_snapshot_2d(
+                    time_hours=float(baseline_field.time_hours),
+                    horizon_hours=self.horizon_hours,
+                    sensors=self._sample_field_at_sensor_grid(baseline_field),
+                    site=self.site_id,
+                    measurement=FEM_TEMPERATURE_BASELINE_MEASUREMENT,
                 )
             elapsed = (datetime.utcnow() - start_time).total_seconds()
             self.logger.info(

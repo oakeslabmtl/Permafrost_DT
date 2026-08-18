@@ -185,6 +185,7 @@ def create_fem_forecast_server(
         include_field_default=fem_cfg.get("include_field_default", False),
         sticky_material_override=fem_cfg.get("sticky_material_override", True),
         field_csv_dir=fem_cfg.get("field_csv_dir") if isinstance(fem_cfg.get("field_csv_dir"), str) else None,
+        run_baseline=fem_cfg.get("run_baseline", False),
     )
 
 
@@ -207,9 +208,9 @@ def create_fem_inversion_server(
 
     fem_input_queue = str(inversion_cfg.get("fem_input_queue", fem_cfg.get("input_queue", inversion_module.FEM_BOUNDARY_QUEUE)))
 
-    invert_params = inversion_cfg.get("invert_params", ["porosity", "lambda_thawed", "cap_s"])
+    invert_params = inversion_cfg.get("invert_params", inversion_module.DEFAULT_INVERT_PARAMS)
     if not isinstance(invert_params, list):
-        invert_params = ["porosity", "lambda_thawed", "cap_s"]
+        invert_params = list(inversion_module.DEFAULT_INVERT_PARAMS)
     invert_params = [str(name) for name in invert_params]
 
     relative_bounds = inversion_cfg.get("relative_bounds", {})
@@ -333,6 +334,7 @@ def create_pipe_boundary_server(
         warm_start=bool(pipe_cfg.get("warm_start", True)),
         passthrough_until_ready=bool(pipe_cfg.get("passthrough_until_ready", True)),
         publish_calibration=bool(pipe_cfg.get("publish_calibration", True)),
+        publish_outlet_validation=bool(pipe_cfg.get("publish_outlet_validation", True)),
     )
 
 

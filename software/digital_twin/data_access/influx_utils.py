@@ -12,6 +12,14 @@ from influxdb_client.client.write_api import SYNCHRONOUS  # type: ignore
 
 from software.utils.logging_setup import get_logger
 
+# The FEM temperature field is stored twice when the forecast service runs its
+# baseline twin: once for the calibrated run (material parameters supplied by
+# the inversion service) and once for the uncalibrated run (fixed configured
+# parameters). Separate measurements rather than a tag, so existing queries and
+# dashboards keep seeing only the calibrated stream.
+FEM_TEMPERATURE_MEASUREMENT = "fem_temperature_2d"
+FEM_TEMPERATURE_BASELINE_MEASUREMENT = "fem_temperature_2d_baseline"
+
 
 @dataclass(frozen=True)
 class InfluxConfig:
@@ -131,14 +139,19 @@ class InfluxHelper:
         horizon_hours: float,
         sensors: Sequence[dict[str, float | str | None]],
         site: str = "default",
+        measurement: str = FEM_TEMPERATURE_MEASUREMENT,
     ) -> None:
-        """Write forecasted 2D FEM temperatures in sensor-like format for comparison."""
+        """Write forecasted 2D FEM temperatures in sensor-like format for comparison.
+
+        ``measurement`` selects the stream: the default calibrated one, or
+        ``FEM_TEMPERATURE_BASELINE_MEASUREMENT`` for the uncalibrated twin run.
+        """
 
         if not sensors:
             return
 
         if self.write_api is None:  # pragma: no cover - runtime fallback
-            self.logger.warning("Influx write skipped (no client available) for measurement fem_temperature_2d")
+            self.logger.warning("Influx write skipped (no client available) for measurement %s", measurement)
             return
 
         timestamp = datetime.datetime.utcnow()
@@ -152,7 +165,7 @@ class InfluxHelper:
                 continue
 
             point = (
-                Point("fem_temperature_2d")
+                Point(measurement)
                 .tag("site_id", site)
                 .tag("sensor_id", sensor_id)
                 .field("temperature", float(temperature))
@@ -173,13 +186,14 @@ class InfluxHelper:
             self.logger.error("Error writing FEM temperature snapshot to InfluxDB: %s", exc)
             return
 
-        if "fem_temperature_2d" not in self._logged_measurements:
+        if measurement not in self._logged_measurements:
             self.logger.info(
-                "fem_temperature_2d write complete (t=%.2fh, sensors=%d)",
+                "%s write complete (t=%.2fh, sensors=%d)",
+                measurement,
                 float(time_hours),
                 len(records),
             )
-            self._logged_measurements.add("fem_temperature_2d")
+            self._logged_measurements.add(measurement)
 
     def query_temperature(self, site="default", depth=None, limit=100):
         query = f'''
@@ -759,11 +773,16 @@ class InfluxHelper:
         site: str = "default",
         limit: int = 5000,
         range_start: str = "-6h",
+        measurement: str = FEM_TEMPERATURE_MEASUREMENT,
     ) -> pd.DataFrame:
-        """Fetch the latest 2D FEM temperature snapshots at sensor-style points."""
+        """Fetch the latest 2D FEM temperature snapshots at sensor-style points.
+
+        Pass ``measurement=FEM_TEMPERATURE_BASELINE_MEASUREMENT`` for the
+        uncalibrated twin run (fixed material parameters, no inversion).
+        """
 
         return self._query_measurement(
-            "fem_temperature_2d",
+            measurement,
             site=site,
             limit=limit,
             range_start=range_start,
@@ -893,6 +912,64 @@ class InfluxHelper:
             self.write_api.write(bucket=self.bucket, record=[record])
         except Exception as exc:  # pragma: no cover - runtime infra
             self.logger.error("Error writing fluid temperatures to InfluxDB: %s", exc)
+
+    def write_pipe_outlet_validation(
+        self,
+        *,
+        time_hours: float,
+        t_inlet_c: float,
+        t_outlet_meas_c: float,
+        t_outlet_sim_c: float,
+        site: str = "default",
+    ) -> None:
+        """Persist the pipe model's outlet prediction beside the measurement.
+
+        All three series are written as one point per fluid sample rather than
+        joined later from separate measurements: the simulated outlet is only
+        meaningful next to the exact inlet/outlet pair the model was driven
+        with, so keeping them on one row guarantees the validation plot compares
+        like with like.
+        """
+
+        if self.write_api is None:  # pragma: no cover - runtime fallback
+            self.logger.warning("Influx write skipped (no client available) for measurement pipe_outlet_validation")
+            return
+
+        record = (
+            Point("pipe_outlet_validation")
+            .tag("site_id", site)
+            .field("time_hours", float(time_hours))
+            .field("t_inlet_c", float(t_inlet_c))
+            .field("t_outlet_meas_c", float(t_outlet_meas_c))
+            .field("t_outlet_sim_c", float(t_outlet_sim_c))
+            .field("error_c", float(t_outlet_sim_c) - float(t_outlet_meas_c))
+            .time(datetime.datetime.utcnow(), write_precision=WritePrecision.NS)
+        )
+        try:
+            self.write_api.write(bucket=self.bucket, record=[record])
+        except Exception as exc:  # pragma: no cover - runtime infra
+            self.logger.error("Error writing pipe outlet validation to InfluxDB: %s", exc)
+            return
+
+        if "pipe_outlet_validation" not in self._logged_measurements:
+            self.logger.info("pipe_outlet_validation write complete (t=%.3fh)", float(time_hours))
+            self._logged_measurements.add("pipe_outlet_validation")
+
+    def query_pipe_outlet_validation(
+        self,
+        *,
+        site: str = "default",
+        limit: int = 5000,
+        range_start: str = "-12h",
+    ) -> pd.DataFrame:
+        """Fetch measured inlet/outlet and simulated outlet for the pipe model."""
+
+        return self._query_measurement(
+            "pipe_outlet_validation",
+            site=site,
+            limit=limit,
+            range_start=range_start,
+        )
 
     def query_fluid_temperatures(
         self,

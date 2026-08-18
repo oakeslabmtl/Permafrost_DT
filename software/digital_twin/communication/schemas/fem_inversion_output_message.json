@@ -7,13 +7,12 @@
     "timestamp": { "type": "string", "format": "date-time" },
     "status": { "type": "string" },
     "parameters": {
+      "description": "Inverted soil parameters; keys follow fem_inversion.invert_params.",
       "type": "object",
       "properties": {
-        "lambda_f": { "type": "number" },
-        "C_f": { "type": "number" },
-        "eta": { "type": "number" },
-        "b": { "type": "number" },
-        "T_nabla": { "type": "number" }
+        "cap_s": { "type": "number" },
+        "k_parameter": { "type": "number" },
+        "lambda_s": { "type": "number" }
       }
     }
   },
